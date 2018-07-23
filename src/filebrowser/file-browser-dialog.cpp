@@ -1,6 +1,7 @@
 #include <QtGlobal>
 #include <QtWidgets>
 #include <QDesktopServices>
+#include <QHBoxLayout>
 
 #include "seafile-applet.h"
 #include "account-mgr.h"
@@ -24,6 +25,7 @@
 #include "rpc/local-repo.h"
 #include "rpc/rpc-client.h"
 #include "ui/private-share-dialog.h"
+#include "ui/logout-view.h"
 
 #include "file-browser-manager.h"
 #include "file-browser-dialog.h"
@@ -37,12 +39,18 @@ namespace {
 enum {
     INDEX_LOADING_VIEW = 0,
     INDEX_TABLE_VIEW,
-    INDEX_LOADING_FAILED_VIEW
+    INDEX_LOADING_FAILED_VIEW,
+    INDEX_EMPTY_VIEW,
+    INDEX_RELOGIN_VIEW,
+    INDEX_SEARCH_VIEW
 };
 
-const char *kLoadingFaieldLabelName = "loadingFailedText";
-const int kToolBarIconSize = 20;
-const int kStatusBarIconSize = 24;
+const char *kLoadingFailedLabelName = "LoadingFailedText";
+const int kToolBarIconSize = 24;
+const int kStatusBarIconSize = 20;
+const int kAllPage = 1;
+const int kPerPageCount = 10000;
+const int kSearchBarWidth = 250;
 //const int kStatusCodePasswordNeeded = 400;
 
 void openFile(const QString& path)
@@ -66,6 +74,10 @@ bool inline findConflict(const QString &name, const QList<SeafDirent> &dirents) 
     return found_conflict;
 }
 
+QString appendTrailingSlash(const QString& input) {
+    return input.endsWith('/') ? input : input + '/';
+}
+
 } // namespace
 
 QStringList FileBrowserDialog::file_names_to_be_pasted_;
@@ -79,11 +91,14 @@ FileBrowserDialog::FileBrowserDialog(const Account &account, const ServerRepo& r
       account_(account),
       repo_(repo),
       current_path_(path),
-      current_readonly_(repo_.readonly)
+      current_readonly_(repo_.readonly),
+      search_request_(NULL),
+      search_text_last_modified_(0),
+      has_password_dialog_(false)
 {
     current_lpath_ = current_path_.split('/');
 
-    data_mgr_ = new DataManager(account_);
+    data_mgr_ = seafApplet->dataManager();
 
     // In German translation there is a "seafile" string, so need to use tr("..").arg(..) here
     QString title = tr("Cloud File Browser");
@@ -106,7 +121,10 @@ FileBrowserDialog::FileBrowserDialog(const Account &account, const ServerRepo& r
     createToolBar();
     createStatusBar();
     createLoadingFailedView();
+    createEmptyView();
     createFileTable();
+
+    relogin_view_ = new LogoutView;
 
     QWidget* widget = new QWidget;
     widget->setObjectName("mainWidget");
@@ -121,15 +139,41 @@ FileBrowserDialog::FileBrowserDialog(const Account &account, const ServerRepo& r
     vlayout->setSpacing(0);
     widget->setLayout(vlayout);
 
+    QHBoxLayout *hlayout = new QHBoxLayout;
+    hlayout->setContentsMargins(1, 0, 1, 0);
+    hlayout->setSpacing(0);
+    hlayout->addWidget(toolbar_);
+    hlayout->addWidget(search_toolbar_);
+
+    search_view_ = new FileBrowserSearchView(this);
+    search_view_->setObjectName("searchResult");
+#ifdef Q_OS_MAC
+    search_view_->setAttribute(Qt::WA_MacShowFocusRect, 0);
+#endif
+    search_model_ = new FileBrowserSearchModel(this);
+    search_view_->setModel(search_model_);
+    search_delegate_ = new FileBrowserSearchItemDelegate(this);
+    delete search_view_->itemDelegate();
+    search_view_->setItemDelegate(search_delegate_);
+
     stack_ = new QStackedWidget;
     stack_->insertWidget(INDEX_LOADING_VIEW, loading_view_);
     stack_->insertWidget(INDEX_TABLE_VIEW, table_view_);
     stack_->insertWidget(INDEX_LOADING_FAILED_VIEW, loading_failed_view_);
+    stack_->insertWidget(INDEX_EMPTY_VIEW, empty_view_);
+    stack_->insertWidget(INDEX_RELOGIN_VIEW, relogin_view_);
+    stack_->insertWidget(INDEX_SEARCH_VIEW, search_view_);
     stack_->setContentsMargins(0, 0, 0, 0);
+    stack_->installEventFilter(this);
+    stack_->setAcceptDrops(true);
 
-    vlayout->addWidget(toolbar_);
+    vlayout->addLayout(hlayout);
     vlayout->addWidget(stack_);
     vlayout->addWidget(status_bar_);
+
+    search_timer_ = new QTimer(this);
+    connect(search_timer_, SIGNAL(timeout()), this, SLOT(doRealSearch()));
+    search_timer_->start(300);
 
     // this <--> table_view_
     connect(table_view_, SIGNAL(direntClicked(const SeafDirent&)),
@@ -158,57 +202,71 @@ FileBrowserDialog::FileBrowserDialog(const Account &account, const ServerRepo& r
             this, SLOT(onCancelDownload(const SeafDirent&)));
     connect(table_view_, SIGNAL(syncSubdirectory(const QString&)),
             this, SLOT(onGetSyncSubdirectory(const QString &)));
+    connect(table_view_, SIGNAL(deleteLocalVersion(const SeafDirent&)),
+            this, SLOT(onDeleteLocalVersion(const SeafDirent&)));
+    connect(table_view_, SIGNAL(localVersionSaveAs(const SeafDirent&)),
+            this, SLOT(onLocalVersionSaveAs(const SeafDirent&)));
+
+    connect(search_view_, SIGNAL(clearSearchBar()),
+            search_bar_, SLOT(clear()));
+
 
     //dirents <--> data_mgr_
-    connect(data_mgr_, SIGNAL(getDirentsSuccess(bool, const QList<SeafDirent>&)),
+    data_mgr_notify_ = new DataManagerNotify(repo_.id);
+    connect(data_mgr_notify_, SIGNAL(getDirentsSuccess(bool, const QList<SeafDirent>&)),
             this, SLOT(onGetDirentsSuccess(bool, const QList<SeafDirent>&)));
-    connect(data_mgr_, SIGNAL(getDirentsFailed(const ApiError&)),
+    connect(data_mgr_notify_, SIGNAL(getDirentsFailed(const ApiError&)),
             this, SLOT(onGetDirentsFailed(const ApiError&)));
 
     //create <--> data_mgr_
-    connect(data_mgr_, SIGNAL(createDirectorySuccess(const QString&)),
+    connect(data_mgr_notify_, SIGNAL(createDirectorySuccess(const QString&)),
             this, SLOT(onDirectoryCreateSuccess(const QString&)));
     connect(data_mgr_, SIGNAL(createDirectoryFailed(const ApiError&)),
             this, SLOT(onDirectoryCreateFailed(const ApiError&)));
 
     //lock <--> data_mgr_
-    connect(data_mgr_, SIGNAL(lockFileSuccess(const QString&, bool)),
+    connect(data_mgr_notify_, SIGNAL(lockFileSuccess(const QString&, bool)),
             this, SLOT(onFileLockSuccess(const QString&, bool)));
     connect(data_mgr_, SIGNAL(lockFileFailed(const ApiError&)),
             this, SLOT(onFileLockFailed(const ApiError&)));
 
     //rename <--> data_mgr_
-    connect(data_mgr_, SIGNAL(renameDirentSuccess(const QString&, const QString&)),
+    connect(data_mgr_notify_, SIGNAL(renameDirentSuccess(const QString&, const QString&)),
             this, SLOT(onDirentRenameSuccess(const QString&, const QString&)));
     connect(data_mgr_, SIGNAL(renameDirentFailed(const ApiError&)),
             this, SLOT(onDirentRenameFailed(const ApiError&)));
 
     //remove <--> data_mgr_
-    connect(data_mgr_, SIGNAL(removeDirentSuccess(const QString&)),
+    connect(data_mgr_notify_, SIGNAL(removeDirentSuccess(const QString&)),
             this, SLOT(onDirentRemoveSuccess(const QString&)));
     connect(data_mgr_, SIGNAL(removeDirentFailed(const ApiError&)),
             this, SLOT(onDirentRemoveFailed(const ApiError&)));
 
+    connect(data_mgr_notify_, SIGNAL(removeDirentsSuccess(const QString&, const QStringList&)),
+            this, SLOT(onDirentsRemoveSuccess(const QString&, const QStringList&)));
+    connect(data_mgr_, SIGNAL(removeDirentsFailed(const ApiError&)),
+            this, SLOT(onDirentsRemoveFailed(const ApiError&)));
+
     //share <--> data_mgr_
-    connect(data_mgr_, SIGNAL(shareDirentSuccess(const QString&)),
+    connect(data_mgr_notify_, SIGNAL(shareDirentSuccess(const QString&)),
             this, SLOT(onDirentShareSuccess(const QString&)));
     connect(data_mgr_, SIGNAL(shareDirentFailed(const ApiError&)),
             this, SLOT(onDirentShareFailed(const ApiError&)));
 
     //copy <--> data_mgr_
-    connect(data_mgr_, SIGNAL(copyDirentsSuccess()),
+    connect(data_mgr_notify_, SIGNAL(copyDirentsSuccess()),
             this, SLOT(onDirentsCopySuccess()));
     connect(data_mgr_, SIGNAL(copyDirentsFailed(const ApiError&)),
             this, SLOT(onDirentsCopyFailed(const ApiError&)));
 
     //move <--> data_mgr_
-    connect(data_mgr_, SIGNAL(moveDirentsSuccess()),
+    connect(data_mgr_notify_, SIGNAL(moveDirentsSuccess()),
             this, SLOT(onDirentsMoveSuccess()));
     connect(data_mgr_, SIGNAL(moveDirentsFailed(const ApiError&)),
             this, SLOT(onDirentsMoveFailed(const ApiError&)));
 
     //subrepo <-->data_mgr_
-    connect(data_mgr_, SIGNAL(createSubrepoSuccess(const ServerRepo &)),
+    connect(data_mgr_notify_, SIGNAL(createSubrepoSuccess(const ServerRepo &)),
             this, SLOT(onCreateSubrepoSuccess(const ServerRepo &)));
     connect(data_mgr_, SIGNAL(createSubrepoFailed(const ApiError&)),
             this, SLOT(onCreateSubrepoFailed(const ApiError&)));
@@ -216,12 +274,19 @@ FileBrowserDialog::FileBrowserDialog(const Account &account, const ServerRepo& r
     connect(AutoUpdateManager::instance(), SIGNAL(fileUpdated(const QString&, const QString&)),
             this, SLOT(onFileAutoUpdated(const QString&, const QString&)));
 
+    AccountManager* account_mgr = seafApplet->accountManager();
+    connect(account_mgr, SIGNAL(accountInfoUpdated(const Account&)), this,
+            SLOT(onAccountInfoUpdated()));
+
     QTimer::singleShot(0, this, SLOT(init()));
+
 }
 
 FileBrowserDialog::~FileBrowserDialog()
 {
-    delete data_mgr_;
+    if (search_request_ != NULL)
+        search_request_->deleteLater();
+    delete data_mgr_notify_;
 }
 
 void FileBrowserDialog::init()
@@ -253,43 +318,59 @@ void FileBrowserDialog::createToolBar()
     toolbar_->addWidget(forward_button_);
     connect(forward_button_, SIGNAL(clicked()), this, SLOT(goForward()));
 
+    // XX: not sure why, but we have to set the styles here, otherwise it won't
+    // work (if we write this in qt.css)
+    backward_button_->setStyleSheet("QToolButton { margin-right: -2px; }");
+    forward_button_->setStyleSheet("QToolButton { margin-left: -2px; margin-right: 10px;}");
+    toolbar_->setStyleSheet("QToolbar { spacing: 0px; }");
+
     gohome_action_ = new QAction(tr("Home"), this);
     gohome_action_->setIcon(QIcon(":images/filebrowser/home.png"));
     connect(gohome_action_, SIGNAL(triggered()), this, SLOT(goHome()));
     toolbar_->addAction(gohome_action_);
+    toolbar_->widgetForAction(gohome_action_)->setObjectName("goHomeButton");
 
     path_navigator_ = new QButtonGroup(this);
     connect(path_navigator_, SIGNAL(buttonClicked(int)),
             this, SLOT(onNavigatorClick(int)));
 
+    search_toolbar_ = new QToolBar;
+    search_toolbar_->setObjectName("topBar");
+    search_toolbar_->setIconSize(QSize(kToolBarIconSize, kToolBarIconSize));
+    search_toolbar_->setFixedWidth(kSearchBarWidth);
+    search_toolbar_->setStyleSheet("QToolbar { spacing: 0px; }");
+
+    search_bar_ = new SearchBar;
+    search_bar_->setPlaceholderText(tr("Search files"));
+    search_toolbar_->addWidget(search_bar_);
+    connect(search_bar_, SIGNAL(textChanged(const QString&)),
+            this, SLOT(doSearch(const QString&)));
+    if (!account_.isPro()) {
+        search_toolbar_->setVisible(false);
+    }
 }
 
 void FileBrowserDialog::createStatusBar()
 {
-    status_bar_ = new QToolBar;
+    status_bar_ = new QWidget;
     status_bar_->setObjectName("statusBar");
-    status_bar_->setIconSize(QSize(kStatusBarIconSize, kStatusBarIconSize));
 
-    QWidget *spacer1 = new QWidget;
-    spacer1->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
-    status_bar_->addWidget(spacer1);
+    status_layout_ = new QHBoxLayout(status_bar_);
+    status_layout_->setContentsMargins(0, 0, 0, 0);
 
     // Submenu
-    upload_menu_ = new QMenu(status_bar_);
+    upload_menu_ = new QMenu;
+    connect(upload_menu_, SIGNAL(aboutToShow()), this, SLOT(fixUploadButtonHighlightStyle()));
+    connect(upload_menu_, SIGNAL(aboutToHide()), this, SLOT(fixUploadButtonNonHighlightStyle()));
 
     // Submenu's Action 1: Upload File
     upload_file_action_ = new QAction(tr("Upload files"), upload_menu_);
     connect(upload_file_action_, SIGNAL(triggered()), this, SLOT(chooseFileToUpload()));
     upload_menu_->addAction(upload_file_action_);
 
-    // Submenu's Action 2: Upload File (only pro version's server supports it)
-    if (account_.isPro()) {
-        upload_directory_action_ = new QAction(tr("Upload a directory"), upload_menu_);
-        connect(upload_directory_action_, SIGNAL(triggered()), this, SLOT(chooseDirectoryToUpload()));
-        upload_menu_->addAction(upload_directory_action_);
-    } else {
-        upload_directory_action_ = NULL;
-    }
+    upload_directory_action_ = new QAction(tr("Upload a directory"), upload_menu_);
+    connect(upload_directory_action_, SIGNAL(triggered()), this, SLOT(chooseDirectoryToUpload()));
+    upload_menu_->addAction(upload_directory_action_);
 
     // Submenu's Action 3: Make a new directory
     mkdir_action_ = new QAction(tr("Create a folder"), upload_menu_);
@@ -300,9 +381,11 @@ void FileBrowserDialog::createStatusBar()
     upload_button_ = new QToolButton;
     upload_button_->setObjectName("uploadButton");
     upload_button_->setToolTip(tr("Upload files"));
-    upload_button_->setIcon(QIcon(":/images/toolbar/add.png"));
+    upload_button_->setIcon(QIcon(":/images/filebrowser/add.png"));
+    upload_button_->setIconSize(QSize(kStatusBarIconSize, kStatusBarIconSize));
+    upload_button_->installEventFilter(this);
     connect(upload_button_, SIGNAL(clicked()), this, SLOT(uploadFileOrMkdir()));
-    status_bar_->addWidget(upload_button_);
+    status_layout_->addWidget(upload_button_);
 
     if (current_readonly_) {
         upload_button_->setEnabled(false);
@@ -312,18 +395,16 @@ void FileBrowserDialog::createStatusBar()
     details_label_ = new QLabel;
     details_label_->setAlignment(Qt::AlignCenter | Qt::AlignVCenter);
     details_label_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    status_bar_->addWidget(details_label_);
+    status_layout_->addWidget(details_label_);
 
-    refresh_action_ = new QAction(this);
-    refresh_action_->setIcon(QIcon(":/images/toolbar/refresh.png"));
-    refresh_action_->setToolTip(tr("Refresh"));
-    connect(refresh_action_, SIGNAL(triggered()), this, SLOT(forceRefresh()));
-    refresh_action_->setShortcut(QKeySequence::Refresh);
-    status_bar_->addAction(refresh_action_);
-
-    QWidget *spacer2 = new QWidget;
-    spacer2->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
-    status_bar_->addWidget(spacer2);
+    refresh_button_ = new QToolButton;
+    refresh_button_->setObjectName("refreshButton");
+    refresh_button_->setToolTip(tr("Refresh"));
+    refresh_button_->setIcon(QIcon(":/images/filebrowser/refresh-gray.png"));
+    refresh_button_->setIconSize(QSize(kStatusBarIconSize, kStatusBarIconSize));
+    refresh_button_->installEventFilter(this);
+    connect(refresh_button_, SIGNAL(clicked()), this, SLOT(onRefresh()));
+    status_layout_->addWidget(refresh_button_);
 }
 
 void FileBrowserDialog::createFileTable()
@@ -332,9 +413,106 @@ void FileBrowserDialog::createFileTable()
     table_view_ = new FileTableView(this);
     table_model_ = new FileTableModel(this);
     table_view_->setModel(table_model_);
+}
 
-    connect(table_view_, SIGNAL(dropFile(const QStringList&)),
-            this, SLOT(uploadOrUpdateMutipleFile(const QStringList&)));
+bool FileBrowserDialog::handleDragDropEvent(QObject *obj, QEvent *event)
+{
+    if (event->type() == QEvent::DragEnter) {
+        QDragEnterEvent* ev = (QDragEnterEvent*)event;
+        // only handle external source currently
+        if(ev->source() != NULL)
+            return false;
+        // Otherwise it might be a MoveAction which is unacceptable
+        ev->setDropAction(Qt::CopyAction);
+        // trivial check
+        if(ev->mimeData()->hasFormat("text/uri-list"))
+            ev->accept();
+        return true;
+    }
+    else if (event->type() == QEvent::Drop) {
+        QDropEvent* ev = (QDropEvent*)event;
+        // only handle external source currently
+        if(ev->source() != NULL)
+            return false;
+
+        QList<QUrl> urls = ev->mimeData()->urls();
+
+        if(urls.isEmpty())
+            return false;
+
+        QStringList paths;
+        Q_FOREACH(const QUrl& url, urls)
+        {
+            QString path = url.toLocalFile();
+#if defined(Q_OS_MAC) && (QT_VERSION <= QT_VERSION_CHECK(5, 4, 0))
+            path = utils::mac::fix_file_id_url(path);
+#endif
+            if(path.isEmpty())
+                continue;
+            paths.push_back(path);
+        }
+
+        ev->accept();
+
+        if (current_readonly_) {
+            seafApplet->warningBox(tr("You do not have permission to upload to this folder"), this);
+        } else {
+            uploadOrUpdateMutipleFile(paths);
+        }
+        return true;
+    }
+    else {
+        return QObject::eventFilter(obj, event);
+    }
+}
+
+bool FileBrowserDialog::eventFilter(QObject *obj, QEvent *event)
+{
+    if (obj == upload_button_) {
+        // Sometimes the upload menu is dismissed, the upload button style won't
+        // change, and we need to handle it manually here as well as in the
+        // aboutToHide signal of the upload_meu. This might be a qt bug.
+        if (event->type() == QEvent::Enter) {
+            fixUploadButtonHighlightStyle();
+            return true;
+        } else if (event->type() == QEvent::Leave) {
+            fixUploadButtonNonHighlightStyle();
+            return true;
+        }
+    } else if (obj == refresh_button_) {
+        if (event->type() == QEvent::Enter) {
+            refresh_button_->setStyleSheet("FileBrowserDialog QToolButton#refreshButton {"
+                                          "background: #DFDFDF; padding: 3px;"
+                                          "margin-right: 12px; border-radius: 2px;}");
+            return true;
+        } else if (event->type() == QEvent::Leave) {
+            refresh_button_->setStyleSheet("FileBrowserDialog QToolButton#refreshButton {"
+                                          "background: #F5F5F7; padding: 0px;"
+                                          "margin-right: 15px;}");
+            return true;
+        }
+    } else if (obj == stack_) {
+        if (stack_->currentIndex() == INDEX_EMPTY_VIEW ||
+            stack_->currentIndex() == INDEX_TABLE_VIEW) {
+            return handleDragDropEvent(obj, event);
+        }
+    }
+
+    return QObject::eventFilter(obj, event);
+}
+
+void FileBrowserDialog::onRefresh()
+{
+    if (!seafApplet->accountManager()->currentAccount().isValid()) {
+            stack_->setCurrentIndex(INDEX_RELOGIN_VIEW);
+            return;
+    }
+    if (!search_bar_->text().isEmpty()) {
+        search_text_last_modified_ = 1;
+        doRealSearch();
+    } else {
+        forceRefresh();
+    }
 }
 
 void FileBrowserDialog::forceRefresh()
@@ -347,14 +525,27 @@ void FileBrowserDialog::fetchDirents()
     fetchDirents(false);
 }
 
+void FileBrowserDialog::updateFileCount()
+{
+    int row_count = 0;
+    if (stack_->currentIndex() == INDEX_TABLE_VIEW)
+        row_count = table_model_->rowCount();
+    if (stack_->currentIndex() == INDEX_SEARCH_VIEW)
+        row_count = search_model_->rowCount();
+
+    details_label_->setText(tr("%1 items").arg(row_count));
+}
+
 void FileBrowserDialog::fetchDirents(bool force_refresh)
 {
-    if (repo_.encrypted && !data_mgr_->isRepoPasswordSet(repo_.id)) {
+    if (!has_password_dialog_ && repo_.encrypted && !data_mgr_->isRepoPasswordSet(repo_.id)) {
+        has_password_dialog_ = true;
         SetRepoPasswordDialog password_dialog(repo_, this);
         if (password_dialog.exec() != QDialog::Accepted) {
             reject();
             return;
         } else {
+            has_password_dialog_ = false;
             data_mgr_->setRepoPasswordSet(repo_.id, password_dialog.password());
         }
     }
@@ -379,12 +570,16 @@ void FileBrowserDialog::onGetDirentsSuccess(bool current_readonly, const QList<S
 
 void FileBrowserDialog::onGetDirentsFailed(const ApiError& error)
 {
-    stack_->setCurrentIndex(INDEX_LOADING_FAILED_VIEW);
+    if (error.httpErrorCode() == 401) {
+        stack_->setCurrentIndex(INDEX_RELOGIN_VIEW);
+    } else {
+        stack_->setCurrentIndex(INDEX_LOADING_FAILED_VIEW);
+    }
 }
 
 void FileBrowserDialog::onMkdirButtonClicked()
 {
-    QString name = QInputDialog::getText(this, tr("Create a folder"),
+    QString name = seafApplet->getText(this, tr("Create a folder"),
         tr("Folder name"));
     name = name.trimmed();
 
@@ -408,23 +603,24 @@ void FileBrowserDialog::onMkdirButtonClicked()
 
 void FileBrowserDialog::createLoadingFailedView()
 {
-    loading_failed_view_ = new QWidget(this);
-
-    QVBoxLayout *layout = new QVBoxLayout;
-    loading_failed_view_->setLayout(layout);
-
-    QLabel *label = new QLabel;
-    label->setObjectName(kLoadingFaieldLabelName);
+    loading_failed_view_ = new QLabel;
+    loading_failed_view_->setObjectName(kLoadingFailedLabelName);
     QString link = QString("<a style=\"color:#777\" href=\"#\">%1</a>").arg(tr("retry"));
     QString label_text = tr("Failed to get files information<br/>"
                             "Please %1").arg(link);
-    label->setText(label_text);
-    label->setAlignment(Qt::AlignCenter);
+    loading_failed_view_->setText(label_text);
+    loading_failed_view_->setAlignment(Qt::AlignCenter);
 
-    connect(label, SIGNAL(linkActivated(const QString&)),
-            this, SLOT(forceRefresh()));
+    connect(loading_failed_view_, SIGNAL(linkActivated(const QString&)),
+            this, SLOT(onRefresh()));
+}
 
-    layout->addWidget(label);
+void FileBrowserDialog::createEmptyView()
+{
+    empty_view_ = new QLabel(this);
+    empty_view_->setText(tr("This folder is empty."));
+    empty_view_->setAlignment(Qt::AlignCenter);
+    empty_view_->setStyleSheet("background-color: white;");
 }
 
 void FileBrowserDialog::onDirentClicked(const SeafDirent& dirent)
@@ -507,9 +703,20 @@ void FileBrowserDialog::onDirClicked(const SeafDirent& dir)
 
 void FileBrowserDialog::enterPath(const QString& path)
 {
+    // printf ("enter path %s\n", toCStr(path));
     current_path_ = path;
     // use QUrl::toPercentEncoding if need
     fetchDirents();
+
+    // QHash<QString, AutoUpdateManager::FileStatus> uploads =
+    //     AutoUpdateManager::instance()->getFileStatusForDirectory(
+    //         account_.getSignature(), repo_.id, path);
+    // if (uploads.empty()) {
+    //     printf("no uploads for dir %s\n", toCStr(path));
+    // }
+    // foreach(const QString& key, uploads.keys()) {
+    //     printf("auto upload status: file=\"%s\", uploading=%d\n", toCStr(key), uploads[key]);
+    // }
 
     // current_path should be guaranteed safe to split!
     current_lpath_ = current_path_.split('/');
@@ -550,7 +757,7 @@ void FileBrowserDialog::enterPath(const QString& path)
         for(int i = 1; i < current_lpath_.size(); i++) {
             QLabel *separator = new QLabel("/");
             separator->setBaseSize(4, 7);
-            separator->setPixmap(QIcon(":/images/filebrowser/path-separator.png").pixmap(QSize(4, 7)));
+            separator->setPixmap(QIcon(":/images/filebrowser/path-separator.png").pixmap(10));
             path_navigator_separators_.push_back(separator);
             toolbar_->addWidget(separator);
             if (i != current_lpath_.size() - 1) {
@@ -609,14 +816,16 @@ void FileBrowserDialog::downloadFile(const QString& path)
     connect(task, SIGNAL(finished(bool)), this, SLOT(onDownloadFinished(bool)));
 }
 
+void FileBrowserDialog::onGetDirentReupload(const SeafDirent& dirent)
+{
+    QString path = ::pathJoin(current_path_, dirent.name);
+    QString local_path = DataManager::getLocalCacheFilePath(repo_.id, path);
+    AutoUpdateManager::instance()->uploadFile(local_path);
+}
+
 void FileBrowserDialog::uploadFile(const QString& path, const QString& name,
                                    bool overwrite)
 {
-    if (QFileInfo(path).isDir() && !account_.isPro()) {
-        seafApplet->warningBox(tr("Feature not supported"), this);
-        return;
-    }
-
     FileUploadTask *task =
       data_mgr_->createUploadTask(repo_.id, current_path_, path, name, overwrite);
     connect(task, SIGNAL(finished(bool)), this, SLOT(onUploadFinished(bool)));
@@ -625,7 +834,7 @@ void FileBrowserDialog::uploadFile(const QString& path, const QString& name,
 
     // set dialog attributes
     dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowModality(Qt::WindowModal);
+    dialog->setWindowModality(Qt::NonModal);
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
@@ -636,27 +845,43 @@ void FileBrowserDialog::uploadMultipleFile(const QStringList& names,
 {
     if (names.empty())
         return;
-    const QString path = QFileInfo(names.front()).path();
+    QString local_path;
     QStringList fnames;
     Q_FOREACH(const QString &name, names) {
         const QFileInfo file = name;
-        // only files are allowed
-        if (!file.isDir() && file.path() == path
-            /* && !account_.isPro*/) {
-            fnames.push_back(file.fileName());
+        if (file.isDir()) {
+            // a dir
+            uploadOrUpdateFile(name);
+        } else {
+            // a file
+            if (local_path.isEmpty()) {
+                local_path = file.path();
+                fnames.push_back(file.fileName());
+            } else if (file.path() == local_path) {
+                fnames.push_back(file.fileName());
+            } else {
+                qWarning(
+                    "upload multiple files: ignore file %s because it's not in "
+                    "the same directory",
+                    toCStr(file.absoluteFilePath()));
+            }
         }
     }
 
+    if (fnames.empty()) {
+        return;
+    }
+
     FileUploadTask *task =
-      data_mgr_->createUploadMultipleTask(repo_.id, current_path_, path, fnames,
-                                          overwrite);
+        data_mgr_->createUploadMultipleTask(repo_.id, current_path_, local_path, fnames,
+                                            overwrite);
     connect(task, SIGNAL(finished(bool)), this, SLOT(onUploadFinished(bool)));
     FileBrowserProgressDialog *dialog = new FileBrowserProgressDialog(task, this);
     task->start();
 
     // set dialog attributes
     dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowModality(Qt::WindowModal);
+    dialog->setWindowModality(Qt::NonModal);
     dialog->show();
     dialog->raise();
     dialog->activateWindow();
@@ -710,6 +935,7 @@ void FileBrowserDialog::uploadOrUpdateMutipleFile(const QStringList &paths)
 void FileBrowserDialog::onDownloadFinished(bool success)
 {
     FileDownloadTask *task = qobject_cast<FileDownloadTask *>(sender());
+    QString _error;
     if (task == NULL)
         return;
     if (success) {
@@ -724,14 +950,26 @@ void FileBrowserDialog::onDownloadFinished(bool success)
         if (task->error() == FileNetworkTask::TaskCanceled)
             return;
 
-        QString msg = tr("Failed to download file: %1").arg(task->errorString());
+        if (task->httpErrorCode() == 404) {
+            _error = tr("File does not exist");
+        } else if (task->httpErrorCode() == 401) {
+            _error = tr("Authorization expired");
+        } else {
+            _error = task->errorString();
+        }
+        QString msg = tr("Failed to download file: %1").arg(_error);
         seafApplet->warningBox(msg, this);
+
+        if (task->httpErrorCode() == 401) {
+            stack_->setCurrentIndex(INDEX_RELOGIN_VIEW);
+        }
     }
 }
 
 void FileBrowserDialog::onUploadFinished(bool success)
 {
     FileUploadTask *task = qobject_cast<FileUploadTask *>(sender());
+    QString _error;
     if (task == NULL)
         return;
 
@@ -748,8 +986,21 @@ void FileBrowserDialog::onUploadFinished(bool success)
         if (task->error() == FileNetworkTask::TaskCanceled)
             return;
 
-        QString msg = tr("Failed to upload file: %1").arg(task->errorString());
+        if (task->httpErrorCode() == 403) {
+            _error = tr("Permission Error!");
+        } else if (task->httpErrorCode() == 404) {
+            _error = tr("Library/Folder not found.");
+        } else if (task->httpErrorCode() == 401) {
+            _error = tr("Authorization expired");
+        } else {
+            _error = task->errorString();
+        }
+        QString msg = tr("Failed to upload file %1: %2").arg(task->failedPath()).arg(_error);
+        qWarning("failed to upload %s",toCStr(QFileInfo(task->failedPath()).fileName()));
         seafApplet->warningBox(msg, this);
+        if (task->httpErrorCode() == 401) {
+            stack_->setCurrentIndex(INDEX_RELOGIN_VIEW);
+        }
         return;
     }
 
@@ -758,20 +1009,10 @@ void FileBrowserDialog::onUploadFinished(bool success)
 
     // Upload Directory Task
     if (qobject_cast<FileUploadDirectoryTask *>(sender())) {
-        const SeafDirent dir = {
-          SeafDirent::DIR,
-          false,
-          "",
-          task->name(),
-          0,
-          QDateTime::currentDateTime().toTime_t(),
-          false,
-          false,
-          "",
-          0
-        };
+        const SeafDirent dir = SeafDirent::dir(task->name());
         // TODO: insert the Item prior to the item where uploading occurs
         table_model_->insertItem(0, dir);
+        updateFileCount();
         return;
     }
 
@@ -782,7 +1023,7 @@ void FileBrowserDialog::onUploadFinished(bool success)
       names.push_back(task->name());
       local_path = QFileInfo(local_path).absolutePath();
     } else {
-      names = multi_task->names();
+      names = multi_task->successfulNames();
       local_path = QFileInfo(local_path).absoluteFilePath();
     }
 
@@ -798,28 +1039,27 @@ void FileBrowserDialog::onUploadFinished(bool success)
     // add the items to tableview
     Q_FOREACH(const QString &name, names) {
         const QFileInfo file = QDir(local_path).filePath(name);
-        const SeafDirent dirent = {
-          SeafDirent::FILE,
-          false,
-          "",
-          name,
-          static_cast<quint64>(file.size()),
-          QDateTime::currentDateTime().toTime_t(),
-          false,
-          false,
-          "",
-          0
-        };
+        const SeafDirent dirent = SeafDirent::file(name, static_cast<quint64>(file.size()));
         if (task->useUpload())
             table_model_->appendItem(dirent);
         else
             table_model_->replaceItem(name, dirent);
     }
+
+    if (stack_->currentIndex() == INDEX_EMPTY_VIEW) {
+        forceRefresh();
+    }
+
+    updateFileCount();
 }
 
 bool FileBrowserDialog::setPasswordAndRetry(FileNetworkTask *task)
 {
     if (task->httpErrorCode() == 400) {
+        if (has_password_dialog_) {
+            return true;
+        }
+        has_password_dialog_ = true;
         SetRepoPasswordDialog password_dialog(repo_, this);
         if (password_dialog.exec() == QDialog::Accepted) {
             if (task->type() == FileNetworkTask::Download)
@@ -835,14 +1075,20 @@ bool FileBrowserDialog::setPasswordAndRetry(FileNetworkTask *task)
 
 void FileBrowserDialog::goForward()
 {
-    QString path = forward_history_.pop();
+    QString path;
+    if (!forward_history_.empty()) {
+        path = forward_history_.pop();
+    }
     backward_history_.push(current_path_);
     enterPath(path);
 }
 
 void FileBrowserDialog::goBackward()
 {
-    QString path = backward_history_.pop();
+    QString path;
+    if (!backward_history_.empty()) {
+        path = backward_history_.pop();
+    }
     forward_history_.push(current_path_);
     enterPath(path);
 }
@@ -853,13 +1099,20 @@ void FileBrowserDialog::goHome()
         return;
     }
     backward_history_.push(current_path_);
+    forward_history_.clear();
     enterPath("/");
 }
 
 void FileBrowserDialog::updateTable(const QList<SeafDirent>& dirents)
 {
-    table_model_->setDirents(dirents);
-    stack_->setCurrentIndex(INDEX_TABLE_VIEW);
+    if (dirents.isEmpty()) {
+        table_model_->setDirents(QList<SeafDirent>());
+        stack_->setCurrentIndex(INDEX_EMPTY_VIEW);
+    } else {
+        table_model_->setDirents(dirents);
+        stack_->setCurrentIndex(INDEX_TABLE_VIEW);
+    }
+
     if (!forward_history_.empty()) {
         forward_button_->setEnabled(true);
     } else {
@@ -874,6 +1127,7 @@ void FileBrowserDialog::updateTable(const QList<SeafDirent>& dirents)
         upload_button_->setEnabled(true);
     }
     gohome_action_->setEnabled(current_path_ != "/");
+    updateFileCount();
 }
 
 void FileBrowserDialog::chooseFileToUpload()
@@ -899,6 +1153,8 @@ void FileBrowserDialog::onNavigatorClick(int id)
     for(int i = 1; i <= id; i++)
       path += current_lpath_[i] + "/";
 
+    backward_history_.push(current_path_);
+    forward_history_.clear();
     enterPath(path);
 }
 
@@ -911,7 +1167,7 @@ void FileBrowserDialog::onGetDirentRename(const SeafDirent& dirent,
                                           QString new_name)
 {
     if (new_name.isEmpty()) {
-        new_name = QInputDialog::getText(this, tr("Rename"),
+        new_name = seafApplet->getText(this, tr("Rename"),
                    QObject::tr("Rename %1 to").arg(dirent.name),
                    QLineEdit::Normal,
                    dirent.name);
@@ -944,11 +1200,11 @@ void FileBrowserDialog::onGetDirentRemove(const QList<const SeafDirent*> &dirent
     if (!seafApplet->yesOrNoBox(tr("Do you really want to delete these items"), this, false))
         return;
 
-    Q_FOREACH(const SeafDirent* dirent, dirents)
-    {
-        data_mgr_->removeDirent(repo_.id, pathJoin(current_path_, dirent->name),
-                                dirent->isFile());
+    QStringList filenames;
+    foreach (const SeafDirent *dirent, dirents) {
+        filenames << dirent->name;
     }
+    data_mgr_->removeDirents(repo_.id, current_path_, filenames);
 }
 
 void FileBrowserDialog::onGetDirentShare(const SeafDirent& dirent)
@@ -984,11 +1240,13 @@ void FileBrowserDialog::onDirectoryCreateSuccess(const QString &path)
     // if no longer current level
     if (::pathJoin(current_path_, name) != path)
         return;
-    const SeafDirent dirent = {SeafDirent::DIR, false, "", name, 0,
-                               QDateTime::currentDateTime().toTime_t(), false,
-                               false, "", 0};
+    const SeafDirent dirent = SeafDirent::dir(name);
     // TODO insert to the pos where the drop event triggered
     table_model_->insertItem(0, dirent);
+    if (stack_->currentIndex() == INDEX_EMPTY_VIEW)
+        forceRefresh();
+
+    updateFileCount();
 }
 
 void FileBrowserDialog::onDirectoryCreateFailed(const ApiError&error)
@@ -1015,6 +1273,7 @@ void FileBrowserDialog::onFileLockSuccess(const QString& path, bool lock)
     SeafDirent new_dirent = *old_dirent;
     new_dirent.is_locked = new_dirent.locked_by_me = lock;
     new_dirent.lock_owner = account_.username;
+    new_dirent.lock_owner_name = account_.accountInfo.name;
     table_model_->replaceItem(name, new_dirent);
 }
 
@@ -1054,9 +1313,36 @@ void FileBrowserDialog::onDirentRemoveSuccess(const QString& path)
     if (::pathJoin(current_path_, name) != path)
         return;
     table_model_->removeItemNamed(name);
+    updateFileCount();
+
+    if (table_model_->rowCount() == 0) {
+        stack_->setCurrentIndex(INDEX_EMPTY_VIEW);
+    }
 }
 
 void FileBrowserDialog::onDirentRemoveFailed(const ApiError&error)
+{
+    seafApplet->warningBox(tr("Remove failed"), this);
+}
+
+void FileBrowserDialog::onDirentsRemoveSuccess(const QString& parent_path,
+                                               const QStringList& filenames)
+{
+    // if no longer current level
+    if (current_path_ != parent_path)
+        return;
+    foreach (const QString& name, filenames) {
+        // printf("removed file: %s\n", name.toUtf8().data());
+        table_model_->removeItemNamed(name);
+    }
+    updateFileCount();
+
+    if (table_model_->rowCount() == 0) {
+        stack_->setCurrentIndex(INDEX_EMPTY_VIEW);
+    }
+}
+
+void FileBrowserDialog::onDirentsRemoveFailed(const ApiError&error)
 {
     seafApplet->warningBox(tr("Remove failed"), this);
 }
@@ -1106,11 +1392,27 @@ void FileBrowserDialog::setFilesToBePasted(bool is_copy, const QStringList &file
 
 void FileBrowserDialog::onGetDirentsPaste()
 {
-    if (repo_id_to_be_pasted_from_ == repo_.id &&
-        current_path_ == dir_path_to_be_pasted_from_) {
-        seafApplet->warningBox(tr("Cannot paste files from the same folder"), this);
-        return;
+    if (repo_id_to_be_pasted_from_ == repo_.id) {
+        if (current_path_ == dir_path_to_be_pasted_from_) {
+            seafApplet->warningBox(tr("Cannot paste files from the same folder"), this);
+            return;
+        }
+
+        if (file_names_to_be_pasted_.isEmpty()) {
+            return;
+        }
+
+        // Paste /a/ into /a/b/ is not allowed
+        for (const QString& name : file_names_to_be_pasted_) {
+            const QString file_path_to_be_pasted =
+                appendTrailingSlash(::pathJoin(dir_path_to_be_pasted_from_, name));
+            if (appendTrailingSlash(current_path_).startsWith(file_path_to_be_pasted)) {
+                seafApplet->warningBox(tr("Cannot paste the folder to its subfolder"), this);
+                return;
+            }
+        }
     }
+
     if (is_copyed_when_pasted_)
         data_mgr_->copyDirents(repo_id_to_be_pasted_from_,
                                dir_path_to_be_pasted_from_,
@@ -1140,8 +1442,11 @@ void FileBrowserDialog::onDirentsMoveSuccess()
     file_names_to_be_pasted_.clear();
     FileBrowserDialog *dialog =
         FileBrowserManager::getInstance()->getDialog(account_to_be_pasted_from_, repo_id_to_be_pasted_from_);
-    if (dialog != NULL && dialog->current_path_ == dir_path_to_be_pasted_from_)
+    if (dialog != NULL && dialog->current_path_ == dir_path_to_be_pasted_from_) {
         dialog->forceRefresh();
+    }
+
+    msleep(500);
     forceRefresh();
 }
 
@@ -1153,6 +1458,43 @@ void FileBrowserDialog::onDirentsMoveFailed(const ApiError& error)
 void FileBrowserDialog::onGetSyncSubdirectory(const QString &folder_name)
 {
     data_mgr_->createSubrepo(folder_name, repo_.id, ::pathJoin(current_path_, folder_name));
+}
+
+void FileBrowserDialog::onDeleteLocalVersion(const SeafDirent &dirent)
+{
+    QString fpath = ::pathJoin(current_path_, dirent.name);
+    QString cached_file = data_mgr_->getLocalCachedFile(repo_.id, fpath, dirent.id);
+    if (!cached_file.isEmpty() && QFileInfo(cached_file).exists()) {
+        QFile::remove(cached_file);
+        return;
+    }
+}
+
+void FileBrowserDialog::onLocalVersionSaveAs(const SeafDirent &dirent)
+{
+    static QDir download_dir(defaultDownloadDir());
+    if (!download_dir.exists())
+       download_dir = QDir::home();
+
+     QString fpath = ::pathJoin(current_path_, dirent.name);
+     QString cached_file = data_mgr_->getLocalCachedFile(repo_.id, fpath, dirent.id);
+     if (!cached_file.isEmpty() && QFileInfo(cached_file).exists()) {
+         QString local_path = QFileDialog::getSaveFileName(this, tr("Enter name of file to save to..."), download_dir.filePath(dirent.name));
+         QFile::copy(cached_file, local_path);
+         return;
+     }
+}
+
+void FileBrowserDialog::onOpenLocalCacheFolder()
+{
+     QString folder =
+             ::pathJoin(data_mgr_->getRepoCacheFolder(repo_.id), current_path_);
+     if (!::createDirIfNotExists(folder)) {
+         seafApplet->warningBox(tr("Unable to create cache folder"), this);
+         return;
+     }
+     if (!QDesktopServices::openUrl(QUrl::fromLocalFile(folder)))
+         seafApplet->warningBox(tr("Unable to open cache folder"), this);
 }
 
 void FileBrowserDialog::onCreateSubrepoSuccess(const ServerRepo &repo)
@@ -1176,4 +1518,202 @@ void FileBrowserDialog::onCreateSubrepoSuccess(const ServerRepo &repo)
 void FileBrowserDialog::onCreateSubrepoFailed(const ApiError&error)
 {
     seafApplet->warningBox(tr("Create library failed!"), this);
+}
+
+void FileBrowserDialog::fixUploadButtonHighlightStyle()
+{
+    fixUploadButtonStyle(true);
+}
+
+void FileBrowserDialog::fixUploadButtonNonHighlightStyle()
+{
+    fixUploadButtonStyle(false);
+}
+
+void FileBrowserDialog::fixUploadButtonStyle(bool highlighted)
+{
+    if (highlighted) {
+        upload_button_->setStyleSheet("FileBrowserDialog QToolButton#uploadButton {"
+                                      "background: #DFDFDF; padding: 3px;"
+                                      "margin-left: 12px; border-radius: 2px;}");
+    } else {
+        // XX: underMouse() return true even if the upload button is not under mouse!
+        //
+        // if (upload_button_->underMouse()) {
+        //     return;
+        // }
+        upload_button_->setStyleSheet("FileBrowserDialog QToolButton#uploadButton {"
+                                      "background: #F5F5F7; padding: 0px;"
+                                      "margin-left: 15px;}");
+    }
+}
+
+void FileBrowserDialog::onAccountInfoUpdated()
+{
+    forceRefresh();
+}
+
+void FileBrowserDialog::doSearch(const QString &keyword)
+{
+    // make it search utf-8 charcters
+    if (keyword.toUtf8().size() < 3) {
+        stack_->setCurrentIndex(INDEX_TABLE_VIEW);
+        updateFileCount();
+        return;
+    }
+
+    // save for doRealSearch
+    search_text_last_modified_ = QDateTime::currentMSecsSinceEpoch();
+}
+
+void FileBrowserDialog::doRealSearch()
+{
+    // not modified
+    if (search_text_last_modified_ == 0)
+        return;
+    // modified too fast
+    if (QDateTime::currentMSecsSinceEpoch() - search_text_last_modified_ <= 300)
+        return;
+
+    if (!account_.isValid())
+        return;
+
+    if (search_request_) {
+        // search_request_->abort();
+        search_request_->deleteLater();
+        search_request_ = NULL;
+    }
+
+    stack_->setCurrentIndex(INDEX_LOADING_VIEW);
+
+    search_request_ = new FileSearchRequest(account_, search_bar_->text(), kAllPage, kPerPageCount, repo_.id);
+    connect(search_request_, SIGNAL(success(const std::vector<FileSearchResult>&, bool, bool)),
+            this, SLOT(onSearchSuccess(const std::vector<FileSearchResult>&, bool, bool)));
+    connect(search_request_, SIGNAL(failed(const ApiError&)),
+            this, SLOT(onSearchFailed(const ApiError&)));
+
+    search_request_->send();
+
+    // reset
+    search_text_last_modified_ = 0;
+}
+
+void FileBrowserDialog::onSearchSuccess(const std::vector<FileSearchResult>& results,
+                                bool is_loading_more,
+                                bool has_more)
+{
+    search_model_->setSearchResult(results);
+    stack_->setCurrentIndex(INDEX_SEARCH_VIEW);
+    updateFileCount();
+}
+
+void FileBrowserDialog::onSearchFailed(const ApiError& error)
+{
+    stack_->setCurrentIndex(INDEX_LOADING_FAILED_VIEW);
+}
+
+
+DataManagerNotify::DataManagerNotify(const QString &repo_id)
+    :repo_id_(repo_id)
+{
+    data_mgr_ = seafApplet->dataManager();
+    connect(data_mgr_, SIGNAL(getDirentsSuccess(bool, const QList<SeafDirent>&, const QString&)),
+            this, SLOT(onGetDirentsSuccess(bool, const QList<SeafDirent>&, const QString&)));
+    connect(data_mgr_, SIGNAL(getDirentsFailed(const ApiError&, const QString&)),
+            this, SLOT(onGetDirentsFailed(const ApiError&, const QString&)));
+    connect(data_mgr_, SIGNAL(createDirectorySuccess(const QString&, const QString&)),
+            this, SLOT(onDirectoryCreateSuccess(const QString&, const QString&)));
+    connect(data_mgr_, SIGNAL(lockFileSuccess(const QString&, bool, const QString&)),
+            this, SLOT(onFileLockSuccess(const QString&, bool, const QString&)));
+    connect(data_mgr_, SIGNAL(renameDirentSuccess(const QString&, const QString&, const QString&)),
+            this, SLOT(onDirentRenameSuccess(const QString&, const QString&, const QString&)));
+    connect(data_mgr_, SIGNAL(removeDirentSuccess(const QString&, const QString&)),
+            this, SLOT(onDirentRemoveSuccess(const QString&, const QString&)));
+    connect(data_mgr_, SIGNAL(removeDirentsSuccess(const QString&, const QStringList&, const QString&)),
+            this, SLOT(onDirentsRemoveSuccess(const QString&, const QStringList&, const QString&)));
+    connect(data_mgr_, SIGNAL(shareDirentSuccess(const QString&, const QString&)),
+            this, SLOT(onDirentShareSuccess(const QString&, const QString&)));
+    connect(data_mgr_, SIGNAL(createSubrepoSuccess(const ServerRepo &, const QString&)),
+            this, SLOT(onCreateSubrepoSuccess(const ServerRepo &, const QString&)));
+    connect(data_mgr_, SIGNAL(copyDirentsSuccess(const QString&)),
+            this, SLOT(onDirentsCopySuccess(const QString&)));
+    connect(data_mgr_, SIGNAL(moveDirentsSuccess(const QString&)),
+            this, SLOT(onDirentsMoveSuccess(const QString&)));
+}
+
+void DataManagerNotify::onGetDirentsSuccess(bool current_readonly, const QList<SeafDirent>& dirents, const QString& repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit getDirentsSuccess(current_readonly, dirents);
+    }
+}
+
+void DataManagerNotify::onGetDirentsFailed(const ApiError &error, const QString &repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit getDirentsFailed(error);
+    }
+}
+
+void DataManagerNotify::onDirectoryCreateSuccess(const QString &path, const QString &repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit createDirectorySuccess(path);
+    }
+}
+
+void DataManagerNotify::onFileLockSuccess(const QString &path, bool lock, const QString &repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit lockFileSuccess(path, lock);
+    }
+}
+
+void DataManagerNotify::onDirentRenameSuccess(const QString &path, const QString &new_name, const QString &repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit renameDirentSuccess(path, new_name);
+    }
+}
+
+void DataManagerNotify::onDirentRemoveSuccess(const QString &path, const QString &repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit removeDirentSuccess(path);
+    }
+}
+
+void DataManagerNotify::onDirentsRemoveSuccess(const QString &parent_path, const QStringList &filenames, const QString &repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit removeDirentsSuccess(parent_path, filenames);
+    }
+}
+
+void DataManagerNotify::onDirentShareSuccess(const QString &link, const QString &repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit shareDirentSuccess(link);
+    }
+}
+
+void DataManagerNotify::onCreateSubrepoSuccess(const ServerRepo &repo, const QString& repo_id)
+{
+    if (repo_id == repo_id_) {
+        emit createSubrepoSuccess(repo);
+    }
+}
+
+void DataManagerNotify::onDirentsCopySuccess(const QString& dst_repo_id)
+{
+    if (dst_repo_id == repo_id_) {
+        emit copyDirentsSuccess();
+    }
+}
+
+void DataManagerNotify::onDirentsMoveSuccess(const QString& dst_repo_id)
+{
+    if (dst_repo_id == repo_id_) {
+        emit moveDirentsSuccess();
+    }
 }

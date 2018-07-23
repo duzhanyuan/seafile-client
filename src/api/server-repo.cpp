@@ -66,19 +66,11 @@ QIcon ServerRepo::getIcon() const
     } else if (readonly) {
         return QIcon(":/images/main-panel/library-readonly.png");
     } else {
-        return QIcon(":/images/main-panel/library.png");
+        return QIcon(":/images/main-panel/library-normal.png");
     }
 }
 
 QPixmap ServerRepo::getPixmap() const
 {
-    if (this->isSubfolder()) {
-        return QPixmap(":/images/main-panel/folder.png");
-    } else if (encrypted) {
-        return QPixmap(":/images/main-panel/library-encrypted.png");
-    } else if (readonly) {
-        return QPixmap(":/images/main-panel/library-readonly.png");
-    } else {
-        return QPixmap(":/images/main-panel/library.png");
-    }
+    return getIcon().pixmap(24);
 }

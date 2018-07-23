@@ -1,8 +1,3 @@
-extern "C" {
-
-#include <ccnet/peer.h>
-
-}
 #include <QtGlobal>
 
 #if (QT_VERSION >= QT_VERSION_CHECK(5, 0, 0))
@@ -31,6 +26,8 @@ extern "C" {
 #include "server-status-service.h"
 #include "api/commit-details.h"
 #include "sync-errors-dialog.h"
+#include "account-mgr.h"
+#include "filebrowser/progress-dialog.h"
 
 #include "tray-icon.h"
 #if defined(Q_OS_MAC)
@@ -106,7 +103,6 @@ private:
     const QString previous_commit_id_;
 };
 
-
 } // namespace
 
 SeafileTrayIcon::SeafileTrayIcon(QObject *parent)
@@ -116,7 +112,8 @@ SeafileTrayIcon::SeafileTrayIcon(QObject *parent)
       state_(STATE_DAEMON_UP),
       next_message_msec_(0),
       sync_errors_dialog_(nullptr),
-      about_dialog_(nullptr)
+      about_dialog_(nullptr),
+      log_dir_uploader_(nullptr)
 {
     setState(STATE_DAEMON_DOWN);
     rotate_timer_ = new QTimer(this);
@@ -182,6 +179,10 @@ void SeafileTrayIcon::createActions()
     open_log_directory_action_->setStatusTip(tr("open %1 log folder").arg(getBrand()));
     connect(open_log_directory_action_, SIGNAL(triggered()), this, SLOT(openLogDirectory()));
 
+    upload_log_directory_action_ = new QAction(tr("Upload log files"), this);
+    upload_log_directory_action_->setStatusTip(tr("upload %1 log files").arg(getBrand()));
+    connect(upload_log_directory_action_, SIGNAL(triggered()), this, SLOT(uploadLogDirectory()));
+
     show_sync_errors_action_ = new QAction(tr("Show file sync errors"), this);
     show_sync_errors_action_->setStatusTip(tr("Show file sync errors"));
     connect(show_sync_errors_action_, SIGNAL(triggered()), this, SLOT(showSyncErrorsDialog()));
@@ -206,6 +207,7 @@ void SeafileTrayIcon::createContextMenu()
     context_menu_->addAction(open_seafile_folder_action_);
     context_menu_->addAction(settings_action_);
     context_menu_->addAction(open_log_directory_action_);
+    //context_menu_->addAction(upload_log_directory_action_);
     context_menu_->addAction(show_sync_errors_action_);
     // context_menu_->addMenu(help_menu_);
     context_menu_->addSeparator();
@@ -230,6 +232,19 @@ void SeafileTrayIcon::prepareContextMenu()
         enable_auto_sync_action_->setVisible(true);
         disable_auto_sync_action_->setVisible(false);
     }
+
+    std::vector<SyncError> errors;
+    bool success = seafApplet->rpcClient()->getSyncErrors(&errors, 0, 1);
+    if (!success) {
+        qDebug("failed to get sync errors");
+        return;
+    }
+
+    if (errors.empty()) {
+        show_sync_errors_action_->setEnabled(false);
+    } else {
+        show_sync_errors_action_->setEnabled(true);
+    }
 }
 
 void SeafileTrayIcon::createGlobalMenuBar()
@@ -243,6 +258,7 @@ void SeafileTrayIcon::createGlobalMenuBar()
     global_menu_->addAction(open_seafile_folder_action_);
     global_menu_->addAction(settings_action_);
     global_menu_->addAction(open_log_directory_action_);
+    //global_menu_->addAction(upload_log_directory_action_);
     global_menu_->addAction(show_sync_errors_action_);
     global_menu_->addSeparator();
     global_menu_->addAction(enable_auto_sync_action_);
@@ -518,6 +534,25 @@ void SeafileTrayIcon::openLogDirectory()
 {
     QString log_path = QDir(seafApplet->configurator()->ccnetDir()).absoluteFilePath("logs");
     QDesktopServices::openUrl(QUrl::fromLocalFile(log_path));
+}
+
+void SeafileTrayIcon::uploadLogDirectory()
+{
+    if (!seafApplet->accountManager()->currentAccount().isValid()) {
+        seafApplet->warningBox(tr("Please login first"));
+        return;
+    }
+
+    if (log_dir_uploader_ == nullptr) {
+        log_dir_uploader_ = new LogDirUploader();
+        connect(log_dir_uploader_, SIGNAL(finished()), this, SLOT(clearUploader()));
+        log_dir_uploader_->start();
+    }
+}
+
+void SeafileTrayIcon::clearUploader()
+{
+    log_dir_uploader_ = nullptr;
 }
 
 void SeafileTrayIcon::showSettingsWindow()

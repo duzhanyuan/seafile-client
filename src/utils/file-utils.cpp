@@ -681,6 +681,9 @@ QString iconPrefixFromFileName(const QString& fileName)
         }
         // } else if (mimetype.contains("application")) {
         //     return "binary";
+    } else if (mimetype.contains("7z") || mimetype.contains("rar") ||
+               mimetype.contains("zip") || mimetype.startsWith("application/x-tar")) {
+        return "zip";
     }
 
     return "";
@@ -706,6 +709,11 @@ QString getIconByFolder()
 QString getIconByFileNameV2(const QString& fileName)
 {
     QString icon = iconPrefixFromFileName(fileName);
+
+    // Use doc icons for text files
+    if (icon == "text") {
+        icon = "ms_word";
+    }
 
     return QString(":/images/files_v2/file_%1.png").arg(icon.isEmpty() ? "unknown" : icon);
 }

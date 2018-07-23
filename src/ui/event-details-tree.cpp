@@ -24,8 +24,6 @@ const int kFileItemWidth = 300;
 const int kFileNameWidth = 260;
 
 const int kFileNameFontSize = 14;
-const char *kFileNameColor = "#3F3F3F";
-const char *kFileNameColorHighlighted = "#544D49";
 
 const char *kFileItemBackgroundColor = "white";
 const char *kFileItemBackgroundColorHighlighted = "#F9E0C7";
@@ -64,7 +62,7 @@ void EventDetailsFileItemDelegate::paint(QPainter *painter,
     // get the device pixel radio from current painter device
     int scale_factor = 1;
 #if (QT_VERSION >= QT_VERSION_CHECK(5, 0, 0))
-    scale_factor = painter->device()->devicePixelRatio();
+    scale_factor = globalDevicePixelRatio();
 #endif // QT5
     QPixmap icon(item->etype_icon().pixmap(QSize(kFileIconHeight, kFileIconHeight) * scale_factor).scaledToHeight(kFileIconHeight * scale_factor));
 #if (QT_VERSION >= QT_VERSION_CHECK(5, 0, 0))

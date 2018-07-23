@@ -1,3 +1,4 @@
+#include <QApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QDateTime>
@@ -23,7 +24,6 @@ namespace {
 
 const char *kFileCacheTopDirName = "file-cache";
 const char *kFileCacheTempTopDirName = "file-cache-tmp";
-const char *kFileCacheDBFileName = "file-cache.db";
 
 inline bool addPath(QFileSystemWatcher *watcher, const QString &file) {
   if (watcher->files().contains(file))
@@ -51,8 +51,16 @@ SINGLETON_IMPL(AutoUpdateManager)
 
 AutoUpdateManager::AutoUpdateManager()
 {
+    system_shut_down_ = false;
     connect(&watcher_, SIGNAL(fileChanged(const QString&)),
             this, SLOT(onFileChanged(const QString&)));
+    connect(qApp, SIGNAL(aboutToQuit()),
+            this, SLOT(systemShutDown()));
+}
+
+void AutoUpdateManager::systemShutDown()
+{
+    system_shut_down_ = true;
 }
 
 void AutoUpdateManager::start()
@@ -78,14 +86,26 @@ void AutoUpdateManager::watchCachedFile(const Account& account,
         if (repo_id == info.repo_id && path == info.path_in_repo)
             return;
     }
+    Q_FOREACH(const WatchedFileInfo& info, watch_infos_)
+    {
+        if (repo_id == info.repo_id && path == info.path_in_repo)
+            return;
+    }
 
     addPath(&watcher_, local_path);
-    watch_infos_[local_path] = WatchedFileInfo(account, repo_id, path);
+
+    QFileInfo finfo(local_path);
+    watch_infos_[local_path] =
+        WatchedFileInfo(account,
+                        repo_id,
+                        path,
+                        finfo.lastModified().toMSecsSinceEpoch(),
+                        finfo.size());
 }
 
 void AutoUpdateManager::cleanCachedFile()
 {
-    qDebug("[AutoUpdateManager] cancel all download tasks");
+    qWarning("[AutoUpdateManager] cancel all download tasks");
     TransferManager::instance()->cancelAllDownloadTasks();
 
     const Account cur_account = seafApplet->accountManager()->currentAccount();
@@ -94,30 +114,64 @@ void AutoUpdateManager::cleanCachedFile()
             watch_infos_.remove(key);
     }
 
+    qWarning("[AutoUpdateManager] clean file caches db");
     FileCache::instance()->cleanCurrentAccountCache();
 
+    qWarning("[AutoUpdateManager] clean file caches");
     CachedFilesCleaner *cleaner = new CachedFilesCleaner();
     QThreadPool::globalInstance()->start(cleaner);
+}
+
+void AutoUpdateManager::uploadFile(const QString& local_path)
+{
+    WatchedFileInfo &info = watch_infos_[local_path];
+
+    FileNetworkTask *task = seafApplet->dataManager()->createUploadTask(
+        info.repo_id, ::getParentPath(info.path_in_repo),
+        local_path, ::getBaseName(local_path), true);
+
+    ((FileUploadTask *)task)->setAcceptUserConfirmation(false);
+
+    connect(task, SIGNAL(finished(bool)),
+            this, SLOT(onUpdateTaskFinished(bool)));
+
+    qDebug("[AutoUpdateManager] start uploading new version of file %s", local_path.toUtf8().data());
+
+    info.uploading = true;
+
+    task->start();
 }
 
 void AutoUpdateManager::onFileChanged(const QString& local_path)
 {
     qDebug("[AutoUpdateManager] detected cache file %s changed", local_path.toUtf8().data());
-#ifdef Q_OS_MAC
-    if (MacImageFilesWorkAround::instance()->isRecentOpenedImage(local_path)) {
-        return;
-    }
-#endif
-    removePath(&watcher_, local_path);
-    QString repo_id, path_in_repo;
     if (!watch_infos_.contains(local_path)) {
         // filter unwanted events
         return;
     }
 
     WatchedFileInfo &info = watch_infos_[local_path];
+    QFileInfo finfo(local_path);
 
-    if (!QFileInfo(local_path).exists()) {
+    // Download the doc file in the mac will automatically upload
+    // If the timestamp has not changed, it will not be uploaded
+    qint64 mtime = finfo.lastModified().toMSecsSinceEpoch();
+    if (mtime == info.mtime) {
+        qDebug("[AutoUpdateManager] Received a file %s upload notification, but the timestamp has not changed, "
+               "it will not upload", local_path.toUtf8().data());
+        return;
+    }
+
+#ifdef Q_OS_MAC
+    if (MacImageFilesWorkAround::instance()->isRecentOpenedImage(local_path)) {
+        qDebug("[AutoUpdateManager] skip the image file updates on mac for %s", toCStr(local_path));
+        return;
+    }
+#endif
+    removePath(&watcher_, local_path);
+    QString repo_id, path_in_repo;
+
+    if (!finfo.exists()) {
         qDebug("[AutoUpdateManager] detected cache file %s renamed or removed", local_path.toUtf8().data());
         WatchedFileInfo deferred_info = info;
         removeWatch(local_path);
@@ -129,43 +183,83 @@ void AutoUpdateManager::onFileChanged(const QString& local_path)
         return;
     }
 
-    DataManager data_mgr(info.account);
-    FileNetworkTask *task = data_mgr.createUploadTask(
-        info.repo_id, ::getParentPath(info.path_in_repo),
-        local_path, ::getBaseName(local_path), true);
-
-    connect(task, SIGNAL(finished(bool)),
-            this, SLOT(onUpdateTaskFinished(bool)));
-
-    qDebug("[AutoUpdateManager] start uploading new version of file %s", local_path.toUtf8().data());
-
-    task->start();
-    info.uploading = true;
+    uploadFile(local_path);
 }
 
 void AutoUpdateManager::onUpdateTaskFinished(bool success)
 {
+    if (system_shut_down_) {
+        return;
+    }
+
     FileUploadTask *task = qobject_cast<FileUploadTask *>(sender());
     if (task == NULL)
         return;
     const QString local_path = task->localFilePath();
-    if (success) {
-        qDebug("[AutoUpdateManager] uploaded new version of file %s", local_path.toUtf8().data());
-        seafApplet->trayIcon()->showMessage(tr("Upload Success"),
-                                            tr("File \"%1\"\nuploaded successfully.").arg(QFileInfo(local_path).fileName()),
-                                            task->repoId());
-        emit fileUpdated(task->repoId(), task->path());
-        addPath(&watcher_, local_path);
-        WatchedFileInfo& info = watch_infos_[local_path];
-        info.uploading = false;
-    } else {
-        qWarning("[AutoUpdateManager] failed to upload new version of file %s", local_path.toUtf8().data());
-        seafApplet->trayIcon()->showMessage(tr("Upload Failure"),
-                                            tr("File \"%1\"\nfailed to upload.").arg(QFileInfo(local_path).fileName()),
-                                            task->repoId());
-        watch_infos_.remove(local_path);
+    const QFileInfo finfo = QFileInfo(local_path);
+    if (!finfo.exists()) {
+        //TODO: What if the delete&recreate happens just before this function is called?
+        qWarning("[AutoUpdateManager] file %s not exists anymore", toCStr(local_path));
         return;
     }
+
+    if (!watch_infos_.contains(local_path)) {
+        qWarning("[AutoUpdateManager] no watch info for file %s", toCStr(local_path));
+        return;
+    }
+    WatchedFileInfo& info = watch_infos_[local_path];
+    info.uploading = false;
+
+    if (success) {
+        qDebug("[AutoUpdateManager] uploaded new version of file %s", local_path.toUtf8().data());
+        info.mtime = finfo.lastModified().toMSecsSinceEpoch();
+        info.fsize = finfo.size();
+        seafApplet->trayIcon()->showMessage(tr("Upload Success"),
+                                            tr("File \"%1\"\nuploaded successfully.").arg(finfo.fileName()),
+                                            task->repoId());
+
+        // This would also set the "uploading" and "num_upload_errors" column to 0.
+        FileCache::instance()->saveCachedFileId(task->repoId(),
+                                                info.path_in_repo,
+                                                task->account().getSignature(),
+                                                task->oid(),
+                                                task->localFilePath());
+        emit fileUpdated(task->repoId(), task->path());
+    } else {
+        qWarning("[AutoUpdateManager] failed to upload new version of file %s: %s",
+                 toCStr(local_path),
+                 toCStr(task->errorString()));
+        QString error_msg;
+        if (task->httpErrorCode() == 403) {
+            error_msg = tr("Permission Error!");
+        } else if (task->httpErrorCode() == 401) {
+            error_msg = tr("Authorization expired");
+        } else if (task->httpErrorCode() == 441) {
+            error_msg = tr("File does not exist");
+        } else {
+            error_msg = task->errorString();
+        }
+
+        QString name = ::getBaseName(local_path);
+        DirentsCache::ReturnEntry retval = DirentsCache::instance()->getCachedDirents(info.repo_id, task->path());
+        QList<SeafDirent> *l = retval.second;
+        QString msg = tr("File \"%1\"\nfailed to upload.").arg(QFileInfo(local_path).fileName());
+        if (l != NULL) {
+            foreach (const SeafDirent dirent, *l) {
+                if (dirent.name == name) {
+                    if (dirent.is_locked) {
+                        msg = tr("The file is locked by %1, "
+                                 "please try again later").arg(dirent.getLockOwnerDisplayString());
+                    }
+                }
+            }
+        }
+        seafApplet->trayIcon()->showMessage(tr("Upload Failure: %1").arg(error_msg),
+                                            msg,
+                                            task->repoId());
+    }
+
+    addPath(&watcher_, local_path);
 }
 
 void AutoUpdateManager::removeWatch(const QString& local_path)
@@ -191,6 +285,57 @@ void AutoUpdateManager::checkFileRecreated()
         // recreate it when the user modifies the file.
         onFileChanged(path);
     }
+}
+
+QHash<QString, AutoUpdateManager::FileStatus>
+AutoUpdateManager::getFileStatusForDirectory(const QString &account_sig,
+                                             const QString &repo_id,
+                                             const QString &parent_dir,
+                                             const QList<SeafDirent>& dirents)
+{
+    QHash<QString, SeafDirent> dirents_map;
+    foreach(const SeafDirent& d, dirents) {
+        if (d.isFile()) {
+            dirents_map[d.name] = d;
+        }
+    }
+
+    QHash<QString, FileStatus> ret;
+    QList<FileCache::CacheEntry> caches =
+        FileCache::instance()->getCachedFilesForDirectory(account_sig, repo_id, parent_dir);
+    if (caches.empty()) {
+        // qDebug("no cached files for dir %s\n", toCStr(parent_dir));
+    }
+    foreach(const FileCache::CacheEntry& entry, caches) {
+        // qDebug("found cache entry: %s\n", entry.path.toUtf8().data());
+
+        QString local_file_path = DataManager::getLocalCacheFilePath(entry.repo_id, entry.path);
+        const QString& file = ::getBaseName(entry.path);
+        bool is_uploading = watch_infos_.contains(local_file_path) && watch_infos_[local_file_path].uploading;
+
+        if (!dirents_map.contains(file)) {
+            // qDebug("cached files no longer exists: %s\n", entry.path.toUtf8().data());
+            continue;
+        }
+
+        const SeafDirent& d = dirents_map[file];
+        if (d.id != entry.file_id) {
+            // qDebug("cached file is a stale version: %s\n", entry.path.toUtf8().data());
+            ret[file] = is_uploading ? UPLOADING : NOT_SYNCED;
+            continue;
+        }
+
+        QFileInfo finfo(local_file_path);
+
+        qint64 mtime = finfo.lastModified().toMSecsSinceEpoch();
+        bool consistent = mtime == entry.seafile_mtime && finfo.size() == entry.seafile_size;
+        if (consistent) {
+            ret[file] = is_uploading ? UPLOADING: SYNCED;
+        } else {
+            ret[file] = is_uploading ? UPLOADING : NOT_SYNCED;
+        }
+    }
+    return ret;
 }
 
 #ifdef Q_OS_MAC
@@ -229,15 +374,8 @@ void CachedFilesCleaner::run()
                                kFileCacheTopDirName);
     QString file_cache_tmp_dir = pathJoin(seafApplet->configurator()->seafileDir(),
                                    kFileCacheTempTopDirName);
-    QString file_cache_db_file = pathJoin(seafApplet->configurator()->seafileDir(),
-                                   kFileCacheDBFileName);
 
     qDebug("[AutoUpdateManager] removing cached files");
-    if (QFile(file_cache_db_file).exists()) {
-        if (!QFile(file_cache_db_file).remove()) {
-            qWarning("[AutoUpdateManager] failed to remove db file");
-        }
-    }
     if (QDir(file_cache_tmp_dir).exists()) {
         delete_dir_recursively(file_cache_tmp_dir);
     }
@@ -245,4 +383,14 @@ void CachedFilesCleaner::run()
         QDir().rename(file_cache_dir, file_cache_tmp_dir);
         delete_dir_recursively(file_cache_tmp_dir);
     }
+}
+
+void AutoUpdateManager::dumpCacheStatus()
+{
+    printf ("---------------BEGIN CACHE INFO -------------\n");
+    foreach(const QString& key, watch_infos_.keys()) {
+        WatchedFileInfo& info = watch_infos_[key];
+        printf ("%s mtime = %lld, fsize = %lld, uploading = %s\n", toCStr(info.path_in_repo), info.mtime, info.fsize, info.uploading ? "true" : "false");
+    }
+    printf ("---------------END CACHE INFO -------------\n");
 }

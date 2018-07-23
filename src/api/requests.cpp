@@ -41,12 +41,13 @@ const char* kGetLoginTokenUrl = "api2/client-login/";
 const char* kFileSearchUrl = "api2/search/";
 const char* kAccountInfoUrl = "api2/account/info/";
 const char* kDirSharedItemsUrl = "api2/repos/%1/dir/shared_items/";
+const char* kRepoSharedUrl = "api2/beshared-repos/%1/";
 const char* kFetchGroupsAndContactsUrl = "api2/groupandcontacts/";
 const char* kFetchGroupsUrl = "api2/groups/";
 const char* kRemoteWipeReportUrl = "api2/device-wiped/";
 const char* kSearchUsersUrl = "api2/search-user/";
-
 const char* kGetThumbnailUrl = "api2/repos/%1/thumbnail/";
+const char* kCreateFileUploadLink = "api/v2.1/upload-links/";
 
 } // namespace
 
@@ -95,6 +96,7 @@ void LoginRequest::requestSuccess(QNetworkReply& reply)
 
     QScopedPointer<json_t, JsonPointerCustomDeleter> json(root);
 
+    QString s2fa_token = reply.rawHeader("X-SEAFILE-S2FA");
     const char* token =
         json_string_value(json_object_get(json.data(), "token"));
     if (token == NULL) {
@@ -103,7 +105,7 @@ void LoginRequest::requestSuccess(QNetworkReply& reply)
         return;
     }
 
-    emit success(token);
+    emit success(token, s2fa_token);
 }
 
 
@@ -682,20 +684,81 @@ void LogoutDeviceRequest::requestSuccess(QNetworkReply& reply)
 }
 
 GetRepoTokensRequest::GetRepoTokensRequest(const Account& account,
-                                           const QStringList& repo_ids)
+                                           const QStringList& repo_ids,
+                                           int batch_size)
     : SeafileApiRequest(account.getAbsoluteUrl(kGetRepoTokensUrl),
                         SeafileApiRequest::METHOD_GET,
-                        account.token)
+                        account.token),
+      account_(account),
+      repo_ids_(repo_ids),
+      batch_offset_(0),
+      batch_size_(batch_size)
 {
-    setUrlParam("repos", repo_ids.join(","));
+}
+
+void GetRepoTokensRequest::send()
+{
+    doNextBatch();
+}
+
+void GetRepoTokensRequest::doNextBatch()
+{
+    if (batch_offset_ >= repo_ids_.size()) {
+        emit success();
+        return;
+    }
+
+    int count;
+    count = qMin(batch_size_, repo_ids_.size() - batch_offset_);
+    batch_req_.reset(new SingleBatchRepoTokensRequest(
+        account_, repo_ids_.mid(batch_offset_, count)));
+
+    connect(batch_req_.data(),
+            SIGNAL(failed(const ApiError &)),
+            this,
+            SIGNAL(failed(const ApiError &)));
+    connect(batch_req_.data(), SIGNAL(success()), this, SLOT(batchSuccess()));
+    batch_req_->send();
+
+    // printf("sending request for one batch: offset = %d, count = %d\n",
+    //        batch_offset_,
+    //        count);
+}
+
+void GetRepoTokensRequest::batchSuccess()
+{
+    const QMap<QString, QString>& tokens = batch_req_->repoTokens();
+
+    // printf ("one batch finished, offset = %d, count = %d\n", batch_offset_, tokens.size());
+
+    repo_tokens_.unite(tokens);
+    batch_offset_ += batch_req_->repoIds().size();
+    doNextBatch();
 }
 
 void GetRepoTokensRequest::requestSuccess(QNetworkReply& reply)
 {
+    // Just a place holder. A `GetRepoTokensRequest` is a wrapper around a
+    // series of `SingleBatchRepoTokensRequest`, which really sends the api
+    // requests.
+}
+
+SingleBatchRepoTokensRequest::SingleBatchRepoTokensRequest(const Account& account,
+                                           const QStringList& repo_ids)
+    : SeafileApiRequest(account.getAbsoluteUrl(kGetRepoTokensUrl),
+                        SeafileApiRequest::METHOD_GET,
+                        account.token),
+      repo_ids_(repo_ids)
+{
+    setUrlParam("repos", repo_ids.join(","));
+}
+
+void SingleBatchRepoTokensRequest::requestSuccess(QNetworkReply& reply)
+{
     json_error_t error;
     json_t* root = parseJSON(reply, &error);
     if (!root) {
-        qWarning("GetRepoTokensRequest: failed to parse json:%s\n", error.text);
+        qWarning("SingleBatchRepoTokensRequest: failed to parse json:%s\n", error.text);
         emit failed(ApiError::fromJsonError());
         return;
     }
@@ -742,13 +805,24 @@ void GetLoginTokenRequest::requestSuccess(QNetworkReply& reply)
 
 FileSearchRequest::FileSearchRequest(const Account& account,
                                      const QString& keyword,
-                                     int per_page)
+                                     int page,
+                                     int per_page,
+                                     const QString& repo_id)
     : SeafileApiRequest(account.getAbsoluteUrl(kFileSearchUrl),
                         SeafileApiRequest::METHOD_GET,
                         account.token),
-      keyword_(keyword)
+      keyword_(keyword),
+      page_(page)
 {
     setUrlParam("q", keyword_);
+    if (page > 0) {
+        setUrlParam("page", QString::number(page));
+    }
+    // per_page = 2;
+    setUrlParam("per_page", QString::number(per_page));
+    if (!repo_id.isEmpty()) {
+        setUrlParam("search_repo", repo_id);
+    }
 }
 
 void FileSearchRequest::requestSuccess(QNetworkReply& reply)
@@ -756,7 +830,7 @@ void FileSearchRequest::requestSuccess(QNetworkReply& reply)
     json_error_t error;
     json_t* root = parseJSON(reply, &error);
     if (!root) {
-        qWarning("FileSearchResult: failed to parse jsn:%s\n", error.text);
+        qWarning("FileSearchResult: failed to parse json:%s\n", error.text);
         emit failed(ApiError::fromJsonError());
         return;
     }
@@ -783,7 +857,10 @@ void FileSearchRequest::requestSuccess(QNetworkReply& reply)
         tmp.size = map["size"].toLongLong();
         retval.push_back(tmp);
     }
-    emit success(retval);
+    bool has_more = dict["has_more"].toBool();
+    bool is_loading_more = page_ > 1;
+
+    emit success(retval, is_loading_more, has_more);
 }
 
 FetchCustomLogoRequest::FetchCustomLogoRequest(const QUrl& url)
@@ -1170,4 +1247,95 @@ void GetThumbnailRequest::requestSuccess(QNetworkReply& reply)
     else {
         emit success(pixmap);
     }
+}
+
+UnshareRepoRequest::UnshareRepoRequest(const Account& account,
+                                       const QString& repo_id,
+                                       const QString& from_user)
+    : SeafileApiRequest(
+          account.getAbsoluteUrl(QString(kRepoSharedUrl).arg(repo_id)),
+          SeafileApiRequest::METHOD_DELETE,
+          account.token),
+      repo_id_(repo_id)
+{
+    setUrlParam("share_type", "personal");
+    setUrlParam("from", from_user);
+}
+
+void UnshareRepoRequest::requestSuccess(QNetworkReply& reply)
+{
+    emit success();
+}
+
+CreateFileUploadLinkRequest::CreateFileUploadLinkRequest(const Account& account,
+                                                         const QString &repo_id,
+                                                         const QString &path,
+                                                         const QString &password)
+    : SeafileApiRequest(
+          account.getAbsoluteUrl(QString(kCreateFileUploadLink)),
+          SeafileApiRequest::METHOD_POST, account.token),
+      repo_id_(repo_id),
+      path_(path),
+      password_(password)
+{
+    setFormParam(QString("repo_id"), repo_id);
+    setFormParam(QString("path"), path);
+    if (!password.isNull()) {
+        setFormParam(QString("password"), password);
+    }
+}
+
+void CreateFileUploadLinkRequest::requestSuccess(QNetworkReply& reply)
+{
+    json_error_t error;
+    json_t* root = parseJSON(reply, &error);
+    if (!root) {
+        qWarning("failed to parse json:%s\n", error.text);
+        emit failed(ApiError::fromJsonError());
+        return;
+    }
+
+    QScopedPointer<json_t, JsonPointerCustomDeleter> json(root);
+    QMap<QString, QVariant> dict = mapFromJSON(json.data(), &error);
+    UploadLinkInfo link_info;
+    link_info.username = dict["username"].toString();
+    link_info.repo_id = dict["repo_id"].toString();
+    link_info.ctime = dict["ctime"].toString();
+    link_info.token = dict["token"].toString();
+    link_info.link = dict["link"].toString();
+    link_info.path = dict["path"].toString();
+
+    emit success(link_info);
+}
+
+GetUploadFileLinkRequest::GetUploadFileLinkRequest(const QString& link)
+    : SeafileApiRequest(link, SeafileApiRequest::METHOD_GET)
+{
+}
+
+void GetUploadFileLinkRequest::requestSuccess(QNetworkReply& reply)
+{
+    json_error_t error;
+    json_t* root = parseJSON(reply, &error);
+    if (!root) {
+        qWarning("failed to parse json:%s\n", error.text);
+        emit failed(ApiError::fromJsonError());
+        return;
+    }
+
+    QScopedPointer<json_t, JsonPointerCustomDeleter> json(root);
+    QMap<QString, QVariant> dict = mapFromJSON(json.data(), &error);
+    QString reply_content(dict["upload_link"].toString());
+
+    do {
+        if (reply_content.size() <= 2)
+            break;
+        QUrl new_url(reply_content);
+        if (!new_url.isValid())
+            break;
+
+        emit success(reply_content);
+        return;
+    } while (0);
+    emit failed(ApiError::fromHttpError(500));
 }

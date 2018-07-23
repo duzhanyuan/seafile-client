@@ -4,17 +4,19 @@
 #include <QObject>
 #include <QVariant>
 #include <QMessageBox>
+#include <QLineEdit>
 
 class Configurator;
 class DaemonManager;
 class SeafileRpcClient;
 class AccountManager;
 class MainWindow;
-class MessageListener;
+class MessagePoller;
 class SeafileTrayIcon;
 class SettingsManager;
 class SettingsDialog;
 class CertsManager;
+class DataManager;
 
 
 /**
@@ -40,14 +42,26 @@ public:
                                                QMessageBox::StandardButton default_btn);
     bool yesOrCancelBox(const QString& msg, QWidget *parent, bool default_ok);
 
-    // Show error in a messagebox and exit
-    void errorAndExit(const QString& error);
+    QString getText(QWidget *parent,
+                    const QString &title,
+                    const QString &label,
+                    QLineEdit::EchoMode mode = QLineEdit::Normal,
+                    const QString &text = QString(),
+                    bool *ok = 0,
+                    Qt::WindowFlags flags = 0,
+                    Qt::InputMethodHints inputMethodHints = Qt::ImhNone);
+
+        // Show error in a messagebox and exit
+        void errorAndExit(const QString &error);
     void restartApp();
 
     // Read preconfigure settings
     QVariant readPreconfigureEntry(const QString& key, const QVariant& default_value = QVariant());
     // ExpandedVars String
     QString readPreconfigureExpandedString(const QString& key, const QString& default_value = QString());
+
+    // Create a unique device id to replace obselete ccnet id
+    QString getUniqueClientId();
 
     // accessors
     AccountManager *accountManager() { return account_mgr_; }
@@ -68,11 +82,14 @@ public:
 
     CertsManager *certsManager() { return certs_mgr_; }
 
+    DataManager *dataManager() { return data_mgr_; }
+
     bool started() { return started_; }
-    bool inExit() { return in_exit_; }
+    bool closingDown() { return in_exit_ || about_to_quit_; }
 
 private slots:
     void onDaemonStarted();
+    void onDaemonRestarted();
     void checkInitVDrive();
     void updateReposPropertyForHttpSync();
     void onAboutToQuit();
@@ -94,7 +111,7 @@ private:
 
     SeafileRpcClient *rpc_client_;
 
-    MessageListener *message_listener_;
+    MessagePoller *message_poller_;
 
     SeafileTrayIcon *tray_icon_;
 
@@ -104,6 +121,8 @@ private:
 
     CertsManager *certs_mgr_;
 
+    DataManager *data_mgr_;
+
     bool started_;
 
     bool in_exit_;
@@ -111,6 +130,8 @@ private:
     QString style_;
 
     bool is_pro_;
+
+    bool about_to_quit_;
 };
 
 /**

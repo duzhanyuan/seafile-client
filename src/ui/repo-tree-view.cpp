@@ -36,6 +36,7 @@
 #include "filebrowser/progress-dialog.h"
 #include "ui/set-repo-password-dialog.h"
 #include "ui/private-share-dialog.h"
+#include "ui/check-repo-root-perm-dialog.h"
 
 #include "repo-tree-view.h"
 
@@ -43,7 +44,6 @@ namespace {
 
 const char *kRepoTreeViewSettingsGroup = "RepoTreeView";
 const char *kRepoTreeViewSettingsExpandedCategories = "expandedCategories";
-const int kRepoCategoryIndicatorWidth = 16;
 const char *kSyncIntervalProperty = "sync-interval";
 
 // A Helper Class to copy file
@@ -109,7 +109,7 @@ RepoTreeView::RepoTreeView(QWidget *parent)
     loadExpandedCategries();
     connect(qApp, SIGNAL(aboutToQuit()),
             this, SLOT(saveExpandedCategries()));
-    connect(seafApplet->accountManager(), SIGNAL(beforeAccountChanged()),
+    connect(seafApplet->accountManager(), SIGNAL(beforeAccountSwitched()),
             this, SLOT(saveExpandedCategries()));
     connect(seafApplet->accountManager(), SIGNAL(accountsChanged()),
             this, SLOT(loadExpandedCategries()));
@@ -118,6 +118,11 @@ RepoTreeView::RepoTreeView(QWidget *parent)
 
     setAcceptDrops(true);
     setDefaultDropAction(Qt::CopyAction);
+    // setAlternatingRowColors(true);
+    setDropIndicatorShown(true);
+
+    current_drop_target_ = QModelIndex();
+    previous_drop_target_ = QModelIndex();
 }
 
 void RepoTreeView::loadExpandedCategries()
@@ -174,6 +179,10 @@ QMenu* RepoTreeView::prepareContextMenu(const RepoItem *item)
     menu->addAction(view_on_web_action_);
     menu->addAction(open_in_filebrowser_action_);
 
+    if (item->repo().isSharedRepo()) {
+        menu->addAction(unshare_action_);
+    }
+
     const Account& account = seafApplet->accountManager()->currentAccount();
     if (account.isPro() && account.username == item->repo().owner) {
         menu->addSeparator();
@@ -187,9 +196,6 @@ QMenu* RepoTreeView::prepareContextMenu(const RepoItem *item)
         menu->addAction(toggle_auto_sync_action_);
         menu->addAction(sync_now_action_);
         menu->addAction(set_sync_interval_action_);
-#if defined(Q_OS_WIN32)
-        menu->addAction(map_netdrive_action_);
-#endif
         menu->addSeparator();
     }
 
@@ -231,7 +237,6 @@ void RepoTreeView::updateRepoActions()
         unsync_action_->setEnabled(false);
         resync_action_->setEnabled(false);
         set_sync_interval_action_->setEnabled(false);
-        map_netdrive_action_->setEnabled(false);
         toggle_auto_sync_action_->setEnabled(false);
         view_on_web_action_->setEnabled(false);
         open_in_filebrowser_action_->setEnabled(false);
@@ -264,9 +269,6 @@ void RepoTreeView::updateRepoActions()
 
         set_sync_interval_action_->setData(QVariant::fromValue(local_repo));
         set_sync_interval_action_->setEnabled(true);
-
-        map_netdrive_action_->setData(QVariant::fromValue(local_repo));
-        map_netdrive_action_->setEnabled(true);
 
         if (seafApplet->settingsManager()->autoSync()) {
             toggle_auto_sync_action_->setData(QVariant::fromValue(local_repo));
@@ -301,11 +303,10 @@ void RepoTreeView::updateRepoActions()
         unsync_action_->setEnabled(false);
         resync_action_->setEnabled(false);
         set_sync_interval_action_->setEnabled(false);
-        map_netdrive_action_->setEnabled(false);
         toggle_auto_sync_action_->setEnabled(false);
     }
 
-    selected_repo_= item->repo();
+    selected_repo_ = item->repo();
     view_on_web_action_->setEnabled(true);
     open_in_filebrowser_action_->setEnabled(true);
 
@@ -326,7 +327,8 @@ QStandardItem* RepoTreeView::getRepoItem(const QModelIndex &index) const
     }
     QSortFilterProxyModel *proxy = (QSortFilterProxyModel *)model();
     RepoTreeModel *tree_model = (RepoTreeModel *)(proxy->sourceModel());
-    QStandardItem *item = tree_model->itemFromIndex(proxy->mapToSource(index));
+    const QModelIndex mapped_index = proxy->mapToSource(index);
+    QStandardItem *item = tree_model->itemFromIndex(mapped_index);
 
     if (item->type() != REPO_ITEM_TYPE &&
         item->type() != REPO_CATEGORY_TYPE) {
@@ -423,6 +425,12 @@ void RepoTreeView::createActions()
 
     connect(open_in_filebrowser_action_, SIGNAL(triggered()), this, SLOT(openInFileBrowser()));
 
+    unshare_action_ = new QAction(tr("&Leave share"), this);
+    unshare_action_->setIcon(QIcon(":/images/leave-share.png"));
+    unshare_action_->setStatusTip(tr("leave share"));
+
+    connect(unshare_action_, SIGNAL(triggered()), this, SLOT(unshareRepo()));
+
     resync_action_ = new QAction(tr("&Resync this library"), this);
     resync_action_->setIcon(QIcon(":/images/resync.png"));
     resync_action_->setStatusTip(tr("unsync and resync this library"));
@@ -431,17 +439,9 @@ void RepoTreeView::createActions()
 
     set_sync_interval_action_ = new QAction(tr("Set sync &Interval"), this);
     set_sync_interval_action_->setIcon(QIcon(":/images/clock.png"));
-    set_sync_interval_action_->setStatusTip(tr("unsync and resync this library"));
+    set_sync_interval_action_->setStatusTip(tr("set sync interval for this library"));
 
     connect(set_sync_interval_action_, SIGNAL(triggered()), this, SLOT(setRepoSyncInterval()));
-
-    map_netdrive_action_ = new QAction(tr("&Map as a network drive"), this);
-    map_netdrive_action_->setIcon(QIcon(":/images/disk.png"));
-    map_netdrive_action_->setStatusTip(tr("map as a network drive"));
-
-#if defined(Q_OS_WIN32)
-    connect(map_netdrive_action_, SIGNAL(triggered()), this, SLOT(mapLibraryAsNetworkDrive()));
-#endif
 }
 
 void RepoTreeView::downloadRepo()
@@ -478,16 +478,20 @@ void RepoTreeView::unsyncRepo()
 {
     LocalRepo repo = qvariant_cast<LocalRepo>(toggle_auto_sync_action_->data());
 
-    QString question = tr("Are you sure to unsync library \"%1\"?").arg(repo.name);
+    QString question = tr("Are you sure to unsync the library \"%1\"?").arg(repo.name);
 
     if (!seafApplet->yesOrCancelBox(question, this, false)) {
         return;
     }
 
+    unsyncRepoImpl(repo);
+}
+
+void RepoTreeView::unsyncRepoImpl(const LocalRepo& repo)
+{
     if (seafApplet->rpcClient()->unsync(repo.id) < 0) {
         seafApplet->warningBox(tr("Failed to unsync library \"%1\"").arg(repo.name), this);
     }
-
     ServerRepo server_repo = RepoService::instance()->getRepo(repo.id);
     if (server_repo.isValid() && server_repo.isSubfolder())
         RepoService::instance()->removeSyncedSubfolder(repo.id);
@@ -566,6 +570,51 @@ void RepoTreeView::shareRepoToGroup()
     shareRepo(true);
 }
 
+void RepoTreeView::unshareRepo()
+{
+    if (!seafApplet->yesOrNoBox(
+            tr("Are you sure you want to leave the share \"%1\"?").arg(
+                selected_repo_.name), this, false)) {
+        return;
+    }
+
+    const Account account = seafApplet->accountManager()->currentAccount();
+    const QString repo_id = selected_repo_.id;
+    const QString from_user = selected_repo_.owner;
+    UnshareRepoRequest* request =
+        new UnshareRepoRequest(account, repo_id, from_user);
+
+    connect(request, SIGNAL(success()),
+            this, SLOT(onUnshareSuccess()));
+    connect(request, SIGNAL(failed(const ApiError&)),
+            this, SLOT(onUnshareFailed(const ApiError&)));
+
+    request->send();
+}
+
+void RepoTreeView::onUnshareSuccess()
+{
+    RepoService::instance()->refresh(true);
+
+    UnshareRepoRequest* req = qobject_cast<UnshareRepoRequest*>(sender());
+    if (!req) {
+        return;
+    } else {
+        req->deleteLater();
+    }
+
+    LocalRepo local_repo;
+    seafApplet->rpcClient()->getLocalRepo(req->repoId(), &local_repo);
+    if (local_repo.isValid()) {
+        unsyncRepoImpl(local_repo);
+    }
+}
+
+void RepoTreeView::onUnshareFailed(const ApiError&error)
+{
+    seafApplet->warningBox(tr("Leaving share failed"), this);
+}
+
 void RepoTreeView::openInFileBrowser()
 {
     const Account account = seafApplet->accountManager()->currentAccount();
@@ -578,7 +627,11 @@ void RepoTreeView::openInFileBrowser()
 
 bool RepoTreeView::viewportEvent(QEvent *event)
 {
-    if (event->type() != QEvent::ToolTip && event->type() != QEvent::WhatsThis && event->type() != QEvent::MouseButtonPress && event->type() != QEvent::MouseButtonRelease) {
+    if (event->type() != QEvent::ToolTip &&
+        event->type() != QEvent::WhatsThis &&
+        event->type() != QEvent::MouseButtonPress &&
+        event->type() != QEvent::MouseButtonRelease)
+    {
         return QTreeView::viewportEvent(event);
     }
 
@@ -596,14 +649,24 @@ bool RepoTreeView::viewportEvent(QEvent *event)
 
     // handle the event in the top
     const QModelIndex top_index = indexAt(QPoint(0, 0));
-    if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease) {
-        if (index == top_index && top_index.parent().isValid() && viewport_pos.y() <= kRepoCategoryIndicatorWidth) {
+    if (event->type() == QEvent::MouseButtonPress ||
+        event->type() == QEvent::MouseButtonRelease)
+    {
+        QSortFilterProxyModel *proxy = (QSortFilterProxyModel *)model();
+        RepoTreeModel *tree_model = (RepoTreeModel *)(proxy->sourceModel());
+
+        if (index == top_index &&
+            top_index.parent().isValid() &&
+            viewport_pos.y() <= tree_model->repo_category_height)
+        {
             QMouseEvent *ev = static_cast<QMouseEvent*>(event);
-            if (!(ev->buttons() & Qt::LeftButton))
+            if (!(ev->buttons() & Qt::LeftButton)) {
                 return true;
-            const QModelIndex parent = top_index.parent();
-            setExpanded(parent, !isExpanded(parent));
-            return true;
+            } else {
+                const QModelIndex parent = top_index.parent();
+                setExpanded(parent, !isExpanded(parent));
+                return true;
+            }
         }
         return QTreeView::viewportEvent(event);
     }
@@ -773,7 +836,7 @@ void RepoTreeView::resyncRepo()
     SeafileRpcClient *rpc = seafApplet->rpcClient();
 
     if (!seafApplet->yesOrNoBox(
-            tr("Are you sure to resync library \"%1\"?").arg(server_repo.name),
+            tr("Are you sure to resync the library \"%1\"?").arg(server_repo.name),
             this)) {
         return;
     }
@@ -805,15 +868,43 @@ void RepoTreeView::dropEvent(QDropEvent *event)
 
     RepoItem *item = static_cast<RepoItem*>(standard_item);
     const ServerRepo &repo = item->repo();
-    const QUrl url = event->mimeData()->urls().at(0);
 
+    updateDropTarget(QModelIndex());
+
+    const QUrl url = event->mimeData()->urls().at(0);
     QString local_path = url.toLocalFile();
 #if defined(Q_OS_MAC) && (QT_VERSION <= QT_VERSION_CHECK(5, 4, 0))
         local_path = utils::mac::fix_file_id_url(local_path);
 #endif
+
+    if (repo.readonly) {
+        // Do not call the `show` method of the dialog. It would show itself if
+        // the task doens't finish within 4 seconds.
+        //
+        // This is also why we can't create the dialog object on stack and use
+        // `dialog.exec()`.
+        CheckRepoRootDirPermDialog *dialog = new CheckRepoRootDirPermDialog(
+            seafApplet->accountManager()->currentAccount(), repo, local_path, this);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        connect(dialog, SIGNAL(finished(int)), this, SLOT(checkRootPermDone()));
+    } else {
+        uploadDroppedFile(repo, local_path);
+    }
+}
+
+void RepoTreeView::checkRootPermDone()
+{
+    CheckRepoRootDirPermDialog *dialog = qobject_cast<CheckRepoRootDirPermDialog *>(sender());
+    if (dialog->hasWritePerm()) {
+        uploadDroppedFile(dialog->repo(), dialog->localPath());
+    } else {
+        seafApplet->warningBox(tr("You do not have permission to upload to this folder"));
+    }
+}
+
+void RepoTreeView::uploadDroppedFile(const ServerRepo& repo, const QString& local_path)
+{
     const QString file_name = QFileInfo(local_path).fileName();
-
-
     // if the repo is synced
     LocalRepo local_repo;
     if (seafApplet->rpcClient()->getLocalRepo(repo.id, &local_repo) >= 0) {
@@ -824,7 +915,7 @@ void RepoTreeView::dropEvent(QDropEvent *event)
         }
 
         if (QFileInfo(target_path).exists()) {
-            if (!seafApplet->yesOrNoBox(tr("Are you sure to overwrite file \"%1\"").arg(file_name)))
+            if (!seafApplet->yesOrNoBox(tr("Are you sure to overwrite the file \"%1\"").arg(file_name)))
                 return;
             if (!QFile(target_path).remove()) {
                 seafApplet->warningBox(tr("Unable to delete file \"%1\"").arg(file_name));
@@ -844,20 +935,33 @@ void RepoTreeView::dropEvent(QDropEvent *event)
 
 void RepoTreeView::dragMoveEvent(QDragMoveEvent *event)
 {
-    DropIndicatorPosition position = dropIndicatorPosition();
-    if (position == QAbstractItemView::OnItem) {
-        event->setDropAction(Qt::CopyAction);
-        event->accept();
-        //TODO highlight the selected item, and dehightlight when it's over
-        // const QModelIndex index = indexAt(event->pos());
-        // RepoItem *item = static_cast<RepoItem*>(getRepoItem(index));
-        // if (!item || item->type() != REPO_ITEM_TYPE) {
-        //     return;
-        // }
+    QPoint pos = event->pos();
+    const QModelIndex index = indexAt(pos);
+    QRect rect = visualRect(index);
+
+    // highlight the selected item, and dehightlight when it's over
+    QStandardItem *item = getRepoItem(index);
+    if (item && item->type() == REPO_ITEM_TYPE) {
+        if (changeGrayBackground(pos, rect)) {
+            updateDropTarget(index);
+            event->setDropAction(Qt::CopyAction);
+            event->accept();
+        } else {
+            updateDropTarget(QModelIndex());
+            event->setDropAction(Qt::IgnoreAction);
+            event->accept();
+        }
     } else {
-        event->setDropAction(Qt::IgnoreAction);
-        event->accept();
+       event->setDropAction(Qt::IgnoreAction);
+       event->accept();
+       return;
     }
+}
+
+void RepoTreeView::dragLeaveEvent(QDragLeaveEvent *event)
+{
+    updateDropTarget(QModelIndex());
+    QTreeView::dragLeaveEvent(event);
 }
 
 void RepoTreeView::dragEnterEvent(QDragEnterEvent *event)
@@ -877,6 +981,44 @@ void RepoTreeView::dragEnterEvent(QDragEnterEvent *event)
             }
         }
     }
+}
+
+bool RepoTreeView::changeGrayBackground(
+    const QPoint& pos, const QRect& rect) const
+{
+    const int margin = 2;
+    if ((pos.y() - rect.top() > margin) &&
+        (rect.bottom() - pos.y() > margin)) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void RepoTreeView::updateBackground()
+{
+    if (current_drop_target_.isValid()) {
+        dataChanged(current_drop_target_, current_drop_target_,
+                    QVector<int>(1, Qt::BackgroundRole));
+    }
+
+    if (previous_drop_target_.isValid()) {
+        dataChanged(previous_drop_target_, previous_drop_target_,
+                    QVector<int>(1, Qt::BackgroundRole));
+    }
+}
+
+void RepoTreeView::updateDropTarget(const QModelIndex& index)
+{
+    previous_drop_target_ = current_drop_target_;
+    if (index.isValid() && index == current_drop_target_) {
+        // No need to repaint since the cursor is still with in the same repo
+        // item.
+        return;
+    }
+
+    current_drop_target_ = index;
+    updateBackground();
 }
 
 void RepoTreeView::uploadFileStart(FileUploadTask *task)
@@ -952,6 +1094,7 @@ void RepoTreeView::setRepoSyncInterval()
     dialog.setWindowTitle(
         tr("Set Sync Internval For Library \"%1\"").arg(local_repo.name));
     dialog.setWindowIcon(QIcon(":/images/seafile.png"));
+    dialog.setWindowFlags(dialog.windowFlags() & ~Qt::WindowContextHelpButtonHint);
     dialog.resize(400, 100);
     if (dialog.exec() != QDialog::Accepted) {
         return;
@@ -965,109 +1108,3 @@ void RepoTreeView::setRepoSyncInterval()
     seafApplet->rpcClient()->setRepoProperty(
         local_repo.id, kSyncIntervalProperty, QString::number(interval));
 }
-
-#if defined(Q_OS_WIN32)
-static bool findNextAvailableDrive(QString* drive)
-{
-    DWORD bitmap = GetLogicalDrives();
-    if (bitmap == 0) {
-        return false;
-    }
-    char disk = 'A';
-    DWORD mask = 1;
-    while (disk <= 'Z') {
-        if (!(bitmap & mask)) {
-            *drive = QString(disk) + ":";
-            return true;
-        }
-        mask = mask << 1;
-        disk += 1;
-    }
-    return false;
-}
-
-static QString getDriveNetworkPath(const QString& drive)
-{
-    wchar_t wbuf[8192];
-    DWORD size = sizeof(wbuf) / sizeof(wchar_t);
-    if (WNetGetConnectionW(drive.toStdWString().c_str(), wbuf, &size) ==
-        NO_ERROR) {
-        return QString::fromWCharArray(wbuf);
-    }
-    return QString();
-}
-
-static bool alreadyMappedAsNetworkDrive(const QString& path, QString* drive)
-{
-    DWORD bitmap = GetLogicalDrives();
-    if (bitmap == 0) {
-        return false;
-    }
-    char disk = 'A';
-    DWORD mask = 1;
-    while (disk <= 'Z') {
-        if (bitmap & mask) {
-            QString drive_root = QString(disk) + ":";
-            if (getDriveNetworkPath(drive_root) == path) {
-                *drive = drive_root;
-                return true;
-            }
-        }
-        mask = mask << 1;
-        disk += 1;
-    }
-    return false;
-}
-
-static QString formatErrorMessage(DWORD error_code)
-{
-    if (error_code == 0) {
-        return QObject::tr("unknown error");
-    }
-    wchar_t wbuf[4096] = {0};
-    ::FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM,
-                    NULL,
-                    error_code,
-                    MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                    wbuf,
-                    (sizeof(wbuf) / sizeof(wchar_t)) - 1,
-                    NULL);
-    return QString::fromWCharArray(wbuf);
-}
-
-void RepoTreeView::mapLibraryAsNetworkDrive()
-{
-    LocalRepo local_repo =
-        qvariant_cast<LocalRepo>(set_sync_interval_action_->data());
-    QString worktree = QDir::toNativeSeparators(local_repo.worktree);
-    // Path format is \\localhost\c$\folder
-    QString net_path = QString("\\\\localhost\\%1$\\%2")
-                           .arg(worktree.left(1).toLower())
-                           .arg(worktree.mid(3));
-
-    QString mapped_drive;
-    if (alreadyMappedAsNetworkDrive(net_path, &mapped_drive)) {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(mapped_drive));
-        return;
-    }
-
-    if (!findNextAvailableDrive(&mapped_drive)) {
-        seafApplet->warningBox(tr("No available windows drive letter"));
-        return;
-    }
-
-    qWarning("path is %s", net_path.toUtf8().data());
-
-    int code = QProcess::execute("net", QStringList() << "use" << mapped_drive
-                                                      << net_path);
-    if (code != 0) {
-        seafApplet->warningBox(tr("Operation failed: %1").arg(formatErrorMessage(code)));
-    } else {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(mapped_drive));
-    }
-}
-#else
-void RepoTreeView::mapLibraryAsNetworkDrive()
-{
-}
-#endif // Q_OS_WIN32

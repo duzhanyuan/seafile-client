@@ -38,8 +38,6 @@ const int kMarginTop = 2;
 const int kPadding = 2;
 const int kMarginBetweenPermissionAndIndicator = 10;
 
-const qint64 kCacheEntryExpireMSecs = 5 * 1000;
-
 const QColor kSelectedItemBackgroundcColor("#F9E0C7");
 const QColor kItemBackgroundColor("white");
 const QColor kItemBottomBorderColor("#f3f3f3");
@@ -75,6 +73,7 @@ PrivateShareDialog::PrivateShareDialog(const Account& account,
 #endif
 
     username_input_ = new QLineEdit(this);
+    username_input_->setObjectName("mUsernameInputBar");
     groupname_input_ = new QComboBox(this);
 
     mInputStack->insertWidget(INDEX_USER_NAME, username_input_);
@@ -95,7 +94,7 @@ PrivateShareDialog::PrivateShareDialog(const Account& account,
     }
     else {
         mInputStack->setCurrentIndex(INDEX_USER_NAME);
-        username_input_->setPlaceholderText(tr("Enter the email address"));
+        username_input_->setPlaceholderText(tr("Enter user name or email address"));
     }
     mOkBtn->setEnabled(false);
     mPermission->setCurrentIndex(0);
@@ -104,17 +103,9 @@ PrivateShareDialog::PrivateShareDialog(const Account& account,
     if (to_group_) {
         fetchGroupsForCompletion();
     } else {
-        completer_.reset(new QCompleter(new QStringListModel(this)));
-#if (QT_VERSION >= QT_VERSION_CHECK(5, 2, 0))
-        completer_->setFilterMode(Qt::MatchContains);
-#endif
-        username_input_->setCompleter(completer_.data());
+        user_name_completer_.reset(new SeafileUserNameCompleter(account_, username_input_));
+        connect(lineEdit(), SIGNAL(returnPressed()), this, SLOT(onUserNameChoosed()));
         getExistingShardItems();
-
-        connect(completer_.data(), SIGNAL(activated(const QString&)),
-                this, SLOT(onCompleterActivatedOrHighlighted(const QString&)));
-        connect(completer_.data(), SIGNAL(highlighted(const QString&)),
-                this, SLOT(onCompleterActivatedOrHighlighted(const QString&)));
     }
 
     connect(mOkBtn, SIGNAL(clicked()), this, SLOT(onOkBtnClicked()));
@@ -128,122 +119,8 @@ PrivateShareDialog::PrivateShareDialog(const Account& account,
             SLOT(onNameInputEdited()));
     connect(model_, SIGNAL(modelReset()), this, SLOT(selectFirstRow()));
 
-    if (!to_group_) {
-        connect(lineEdit(), SIGNAL(textChanged(const QString&)), this,
-                SLOT(onUserNameChanged(const QString&)));
-        connect(lineEdit(), SIGNAL(editingFinished()), this,
-                SLOT(onUserNameEditingFinished()));
-    }
-
     adjustSize();
     disableInputs();
-}
-
-static qint64 lastChangedTS;
-
-void PrivateShareDialog::onCompleterActivatedOrHighlighted(const QString& text)
-{
-    lastChangedTS = QDateTime::currentMSecsSinceEpoch();
-}
-
-void PrivateShareDialog::onUserNameEditingFinished()
-{
-}
-
-void PrivateShareDialog::onUserNameChanged(const QString& email)
-{
-    QString pattern = lineEdit()->text().trimmed();
-    if (pattern.isEmpty()) {
-        return;
-    }
-
-    QRegExp re(QString("^.+ <(.*)>$"));
-    if (re.exactMatch(pattern)) {
-        lineEdit()->setText(re.cap(1));
-        // TODO: consider use a custom completer or write custom key events
-        // handler here to get a better auto completion experience.
-        //
-        // See http://doc.qt.io/qt-5/qtwidgets-tools-customcompleter-example.html
-        return;
-    }
-
-    // if (QDateTime::currentMSecsSinceEpoch() - lastChangedTS <  300) {
-    //     return;
-    // }
-
-    // The search result is cached
-    if (cached_completion_users_by_pattern_.contains(pattern) &&
-        cached_completion_users_by_pattern_[pattern].ts + kCacheEntryExpireMSecs >
-            QDateTime::currentMSecsSinceEpoch()) {
-        // printf("cached results for %s\n", toCStr(pattern));
-        updateUsersCompletion(cached_completion_users_by_pattern_[pattern].users.toList());
-        return;
-    }
-
-    foreach(const QString& key, in_progress_search_requests_) {
-        // printf ("already a request for %s\n", toCStr(pattern));
-        if (pattern == key) {
-            return;
-        }
-    }
-
-    // printf("request completions for username %s\n", email.toUtf8().data());
-    SearchUsersRequest *req = new SearchUsersRequest(account_, pattern);
-    req->setParent(this);
-    connect(req,
-            SIGNAL(success(const QList<SeafileUser> &)),
-            this,
-            SLOT(onSearchUsersSuccess(const QList<SeafileUser> &)));
-    connect(req,
-            SIGNAL(failed(const ApiError &)),
-            this,
-            SLOT(onSearchUsersFailed(const ApiError &)));
-    req->send();
-
-    in_progress_search_requests_.insert(pattern);
-}
-
-void PrivateShareDialog::onSearchUsersSuccess(const QList<SeafileUser> &users)
-{
-    SearchUsersRequest *req = qobject_cast<SearchUsersRequest*>(sender());
-    in_progress_search_requests_.remove(req->pattern());
-    req->deleteLater();
-
-    updateUsersCompletion(users);
-
-    cached_completion_users_by_pattern_[req->pattern()] = {QSet<SeafileUser>::fromList(users), QDateTime::currentMSecsSinceEpoch()};
-
-    // printf("get %d results for pattern %s\n", users.size(), toCStr(req->pattern()));
-}
-
-void PrivateShareDialog::updateUsersCompletion(const QList<SeafileUser>& users)
-{
-    QStringList candidates;
-    foreach (const SeafileUser& user, users) {
-        // The local accounts database account.username is the user email, not contact_email.
-        if (user.email == account_.username) {
-            continue;
-        }
-        users_by_email_[user.getDisplayEmail()] = user;
-        if (!user.name.isEmpty()) {
-            candidates << QString("%1 <%2>")
-                                .arg(user.name)
-                                .arg(user.getDisplayEmail());
-        }
-        else {
-            candidates << user.getDisplayEmail();
-        }
-    }
-    QStringListModel *users_complete_model = (QStringListModel *)(completer_->model());
-    users_complete_model->setStringList(candidates);
-}
-
-
-void PrivateShareDialog::onSearchUsersFailed(const ApiError& error)
-{
-    SearchUsersRequest *req = qobject_cast<SearchUsersRequest*>(sender());
-    in_progress_search_requests_.remove(req->pattern());
-    req->deleteLater();
 }
 
 void PrivateShareDialog::selectFirstRow()
@@ -270,6 +147,7 @@ void PrivateShareDialog::createTable()
     vlayout->insertWidget(1, table_);
 
     table_->setItemDelegate(new SharedItemDelegate(this));
+    table_->setEditTriggers(QAbstractItemView::SelectedClicked);
 
     // Overloaded signal for updating group share.
     connect(model_, SIGNAL(updateShareItem(int, SharePermission)), this,
@@ -288,7 +166,13 @@ void PrivateShareDialog::createTable()
 
 void PrivateShareDialog::onNameInputEdited()
 {
-    mOkBtn->setEnabled(!lineEdit()->text().trimmed().isEmpty());
+    if (to_group_) {
+        mOkBtn->setEnabled(!lineEdit()->text().trimmed().isEmpty());
+    } else {
+        // We only enable the confirm button after the user chooses an candidate
+        // from the completion list.
+        mOkBtn->setEnabled(false);
+    }
 }
 
 void PrivateShareDialog::fetchGroupsForCompletion()
@@ -355,13 +239,11 @@ void PrivateShareDialog::onUpdateShareSuccess()
         table_->setCurrentIndex(model_->getIndexByUser(info.user));
     }
     model_->shareOperationSuccess();
-    // enableInputs();
     mStatusText->setText(tr("Updated successfully"));
 }
 
 void PrivateShareDialog::onUpdateShareFailed(const ApiError& error)
 {
-    // enableInputs();
     request_in_progress_ = false;
     showWarning(tr("Share Operation Failed: %1").arg(error.toString()));
     model_->shareOperationFailed(request_->shareOperation());
@@ -386,7 +268,6 @@ void PrivateShareDialog::onRemoveShareItem(int group_id,
 
 void PrivateShareDialog::onRemoveShareSuccess()
 {
-    // enableInputs();
     request_in_progress_ = false;
     model_->shareOperationSuccess();
     mStatusText->setText(tr("Removed successfully"));
@@ -397,7 +278,6 @@ void PrivateShareDialog::onRemoveShareFailed(const ApiError& error)
     request_in_progress_ = false;
     showWarning(tr("Share Operation Failed: %1").arg(error.toString()));
     model_->shareOperationFailed(request_->shareOperation());
-    // enableInputs();
 }
 
 void PrivateShareDialog::onRemoveShareItem(const SeafileUser& user,
@@ -480,8 +360,8 @@ bool PrivateShareDialog::validateInputs()
 {
     QString name = lineEdit()->text().trimmed();
     if (name.isEmpty()) {
-        showWarning(to_group_ ? tr("Please enter the username")
-                              : tr("Please enter the group name"));
+        showWarning(to_group_ ? tr("Please enter the group name")
+                              : tr("Please enter the username"));
         return false;
     }
 
@@ -509,11 +389,12 @@ bool PrivateShareDialog::validateInputs()
         }
     }
     else {
-        if (!users_by_email_.contains(name)) {
-            showWarning(tr("No such user \"%1\"").arg(name));
+        const SeafileUser& user = user_name_completer_->currentSelectedUser();
+        if (!user.isValid()) {
+            showWarning(tr("Please enter the username"));
             return false;
         }
-        SeafileUser user = users_by_email_[name];
+
         if (model_->shareExists(user)) {
             UserShareInfo info = model_->shareInfo(user);
             if (info.permission == permission) {
@@ -536,6 +417,14 @@ SeafileGroup PrivateShareDialog::findGroup(const QString& name)
     return SeafileGroup();
 }
 
+void PrivateShareDialog::onUserNameChoosed()
+{
+    const SeafileUser& user = user_name_completer_->currentSelectedUser();
+    if (user.isValid()) {
+        mOkBtn->setEnabled(true);
+    }
+}
+
 void PrivateShareDialog::onOkBtnClicked()
 {
     if (!validateInputs()) {
@@ -547,7 +436,6 @@ void PrivateShareDialog::onOkBtnClicked()
     }
 
     // disableInputs();
-    QString username;
     SeafileGroup group;
     SeafileUser user;
     QString name = lineEdit()->text().trimmed();
@@ -555,7 +443,7 @@ void PrivateShareDialog::onOkBtnClicked()
         group = findGroup(name);
     }
     else {
-        user = users_by_email_[name];
+        user = user_name_completer_->currentSelectedUser();
     }
     request_.reset(new PrivateShareRequest(
         account_, repo_id_, path_, user, group.id, currentPermission(),
@@ -608,14 +496,12 @@ void PrivateShareDialog::onShareSuccess()
     // seafApplet->messageBox(tr("Shared successfully"), this);
     request_in_progress_ = false;
     model_->shareOperationSuccess();
-    // enableInputs();
     mStatusText->clear();
 }
 
 void PrivateShareDialog::onShareFailed(const ApiError& error)
 {
     request_in_progress_ = false;
-    // enableInputs();
     model_->shareOperationFailed(PrivateShareRequest::ADD_SHARE);
     showWarning(tr("Share Operation Failed: %1").arg(error.toString()));
 }
@@ -723,7 +609,7 @@ QVariant SharedItemsTableModel::data(const QModelIndex& index, int role) const
 
     if (role == Qt::ToolTipRole) {
         if (column == COLUMN_PERMISSION) {
-            return tr("Double click to edit");
+            return tr("Click to edit");
         }
         else {
             if (isGroupShare()) {

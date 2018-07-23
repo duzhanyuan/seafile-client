@@ -35,7 +35,7 @@ public:
 
     void setHeader(const QString& key, const QString& value);
 
-    void send();
+    virtual void send();
 
     const QNetworkReply* reply() const;
 
@@ -71,6 +71,9 @@ protected:
             json_decref(json);
         }
     };
+
+private slots:
+    void updateServerStatus();
 
 private:
     Q_DISABLE_COPY(SeafileApiRequest)

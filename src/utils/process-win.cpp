@@ -12,6 +12,8 @@
 #include <string.h>
 #include <string>
 
+#include <QList>
+
 #include "process.h"
 
 namespace {
@@ -37,7 +39,6 @@ get_process_handle (const char *process_name_in)
 
     HANDLE hProcess;
     DWORD hCurrentProcessId = GetCurrentProcessId();
-    char process_name[4096];
     unsigned int i;
     DWORD length;
 
@@ -50,6 +51,8 @@ get_process_handle (const char *process_name_in)
                                 SYNCHRONIZE , FALSE, aProcesses[i]);
         if (!hProcess)
             continue;
+
+        char process_name[4096] = {0};
 
         // The GetProcessImageFileName function returns the path in device form, rather than drive letters
         // https://msdn.microsoft.com/en-us/library/windows/desktop/ms683196%28v=vs.85%29.aspx
@@ -109,15 +112,17 @@ void shutdown_process (const char *name)
     while (win32_kill_process(name) >= 0) ;
 }
 
-int count_process (const char *process_name_in)
+// Return the number of processes with the given executable name, and also
+// return the list of pids of them (except the current process, if it mathces)
+static int count_process_internal (const char *process_name_in, QList<uint64_t> *pids)
 {
     char name[MAX_PATH];
-    char process_name[MAX_PATH];
     DWORD aProcesses[1024], cbNeeded, cProcesses;
     HANDLE hProcess;
     DWORD length;
     int count = 0;
     DWORD i;
+    DWORD hCurrentProcessId = GetCurrentProcessId();
 
     if (strstr(process_name_in, ".exe")) {
         snprintf (name, sizeof(name), "%s", process_name_in);
@@ -140,6 +145,7 @@ int count_process (const char *process_name_in)
             continue;
         }
 
+        char process_name[4096] = {0};
         if (!(length = GetProcessImageFileName(hProcess, process_name, sizeof(process_name)))) {
             CloseHandle(hProcess);
             continue;
@@ -154,9 +160,26 @@ int count_process (const char *process_name_in)
             continue;
         }
 
+        if (pids && aProcesses[i] != hCurrentProcessId) {
+            pids->append(aProcesses[i]);
+        }
         count++;
         CloseHandle(hProcess);
     }
 
     return count;
+}
+
+int count_process (const char *process_name_in) {
+    return count_process_internal(process_name_in, nullptr);
+}
+
+int count_process(const char *name, uint64_t *pid)
+{
+    QList<uint64_t> pids;
+    int ret = count_process_internal(name, &pids);
+    if (pid && !pids.isEmpty()) {
+        *pid = pids[0];
+    }
+    return ret;
 }

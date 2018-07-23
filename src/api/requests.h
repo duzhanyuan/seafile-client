@@ -2,6 +2,7 @@
 #define SEAFILE_CLIENT_API_REQUESTS_H
 
 #include <QMap>
+#include <QScopedPointer>
 #include <vector>
 
 #include "account.h"
@@ -50,7 +51,7 @@ protected slots:
     void requestSuccess(QNetworkReply& reply);
 
 signals:
-    void success(const QString& token);
+    void success(const QString& token, const QString& s2fa_token);
 
 private:
     Q_DISABLE_COPY(LoginRequest)
@@ -404,13 +405,45 @@ private:
     Account account_;
 };
 
+class SingleBatchRepoTokensRequest : public SeafileApiRequest
+{
+    Q_OBJECT
+public:
+    SingleBatchRepoTokensRequest(const Account& account, const QStringList& repo_ids);
+
+    const QMap<QString, QString>& repoTokens() const
+    {
+        return repo_tokens_;
+    }
+
+    const QStringList repoIds() const {
+        return repo_ids_;
+    }
+
+signals:
+    void success();
+
+protected slots:
+    void requestSuccess(QNetworkReply& reply);
+
+private:
+    Q_DISABLE_COPY(SingleBatchRepoTokensRequest);
+
+    QStringList repo_ids_;
+    QMap<QString, QString> repo_tokens_;
+};
+
+// Request repo sync tokens from the server, and break the request into batches
+// if there are too many, to avoid request URI too large.
 class GetRepoTokensRequest : public SeafileApiRequest
 {
     Q_OBJECT
 public:
-    GetRepoTokensRequest(const Account& account, const QStringList& repo_ids);
+    GetRepoTokensRequest(const Account& account, const QStringList& repo_ids, int batch_size=50);
 
-    const QMap<QString, QString>& repoTokens()
+    virtual void send() Q_DECL_OVERRIDE;
+
+    const QMap<QString, QString>& repoTokens() const
     {
         return repo_tokens_;
     }
@@ -421,10 +454,24 @@ signals:
 protected slots:
     void requestSuccess(QNetworkReply& reply);
 
+private slots:
+    void batchSuccess();
+
 private:
     Q_DISABLE_COPY(GetRepoTokensRequest);
 
+    void doNextBatch();
+
+    Account account_;
+    QStringList repo_ids_;
     QMap<QString, QString> repo_tokens_;
+
+    // The start position of the next batch
+    int batch_offset_;
+    // How many tokens to ask in a single request
+    int batch_size_;
+
+    QScopedPointer<SingleBatchRepoTokensRequest, QScopedPointerDeleteLater> batch_req_;
 };
 
 class GetLoginTokenRequest : public SeafileApiRequest
@@ -473,14 +520,18 @@ class FileSearchRequest : public SeafileApiRequest
 public:
     FileSearchRequest(const Account& account,
                       const QString& keyword,
-                      int per_page = 10);
+                      int page = 0,
+                      int per_page = 10,
+                      const QString& repo_id = QString());
     const QString& keyword() const
     {
         return keyword_;
     }
 
 signals:
-    void success(const std::vector<FileSearchResult>& result);
+    void success(const std::vector<FileSearchResult>& result,
+                 bool is_loading_more,
+                 bool has_more);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -489,6 +540,7 @@ private:
     Q_DISABLE_COPY(FileSearchRequest);
 
     const QString keyword_;
+    const int page_;
 };
 
 class FetchCustomLogoRequest : public SeafileApiRequest
@@ -719,6 +771,75 @@ private:
     QString path_;
     QString dirent_id_;
     uint size_;
+};
+
+class UnshareRepoRequest : public SeafileApiRequest
+{
+    Q_OBJECT
+public:
+    UnshareRepoRequest(const Account& account,
+                       const QString& repo_id,
+                       const QString& from_user);
+
+    const QString& repoId() { return repo_id_; }
+
+signals:
+    void success();
+
+protected slots:
+    void requestSuccess(QNetworkReply& reply);
+
+private:
+    Q_DISABLE_COPY(UnshareRepoRequest);
+
+    QString repo_id_;
+};
+
+struct UploadLinkInfo {
+    QString username;
+    QString repo_id;
+    QString ctime;
+    QString token;
+    QString link;
+    QString path;
+};
+
+class CreateFileUploadLinkRequest : public SeafileApiRequest
+{
+    Q_OBJECT
+public:
+    CreateFileUploadLinkRequest(const Account& account,
+                         const QString& repo_id,
+                         const QString& path,
+                         const QString& password = QString());
+
+signals:
+    void success(const UploadLinkInfo& link_info);
+
+protected slots:
+    void requestSuccess(QNetworkReply& reply);
+
+private:
+    Q_DISABLE_COPY(CreateFileUploadLinkRequest);
+    QString repo_id_;
+    QString path_;
+    QString password_;
+};
+
+class GetUploadFileLinkRequest : public SeafileApiRequest
+{
+    Q_OBJECT
+public:
+    GetUploadFileLinkRequest(const QString& link);
+
+signals:
+    void success(const QString& url);
+
+protected slots:
+    void requestSuccess(QNetworkReply& reply);
+
+private:
+    Q_DISABLE_COPY(GetUploadFileLinkRequest);
 };
 
 #endif // SEAFILE_CLIENT_API_REQUESTS_H

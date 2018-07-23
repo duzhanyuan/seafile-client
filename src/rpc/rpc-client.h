@@ -9,11 +9,15 @@
 extern "C" {
 
 struct _GList;
-struct _CcnetClient;
 // Can't forward-declare type SearpcClient here because it is an anonymous typedef struct
 #include <searpc-client.h>
 
 }
+
+// Here we can't forward-declare type json_t because it is an anonymous typedef
+// struct, and unlike libsearpc we have no way to rewrite its definition to give
+// it a name.
+#include <jansson.h>
 
 class LocalRepo;
 class CloneTask;
@@ -26,7 +30,9 @@ class SeafileRpcClient : public QObject {
 public:
     SeafileRpcClient();
     ~SeafileRpcClient();
-    void connectDaemon();
+    bool tryConnectDaemon() { return connectDaemon(false); }
+    bool connectDaemon(bool exit_on_error = true);
+    bool isConnected() const { return connected_; }
 
     int listLocalRepos(std::vector<LocalRepo> *repos);
     int getLocalRepo(const QString& repo_id, LocalRepo *repo);
@@ -51,10 +57,8 @@ public:
                   const QString& more_info,
                   QString *error);
 
-    int ccnetGetConfig(const QString& key, QString *value);
     int seafileGetConfig(const QString& key, QString *value);
     int seafileGetConfigInt(const QString& key, int *value);
-    int ccnetSetConfig(const QString& key, const QString& value);
     int seafileSetConfig(const QString& key, const QString& value);
     int seafileSetConfigInt(const QString& key, int value);
 
@@ -132,25 +136,25 @@ public:
 
     bool getSyncErrors(std::vector<SyncError> *errors, int offset=0, int limit=10);
 
+    bool getSyncNotification(json_t **ret);
+
 private:
     Q_DISABLE_COPY(SeafileRpcClient)
 
     void getTransferDetail(CloneTask* task);
-    void getCheckOutDetail(CloneTask* task);
-    int setRateLimit(bool upload, int limit);
 
+    enum Direction {
+        DOWNLOAD = 0,
+        UPLOAD
+    };
+    int setRateLimit(Direction, int limit);
 
-    _CcnetClient *sync_client_;
+    bool connected_;
 
-    // Since the threaded rpc calls are less common, it's better to use a
-    // dedicated ccnet client for them. Otherwise we need to do lock/unlock
-    // operation for every rpc call.
-    _CcnetClient *sync_client_for_threaded_rpc_;
     QMutex threaded_rpc_mutex_;
 
     SearpcClient *seafile_rpc_client_;
     SearpcClient *seafile_threaded_rpc_client_;
-    SearpcClient *ccnet_rpc_client_;
 };
 
 #endif

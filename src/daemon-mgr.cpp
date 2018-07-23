@@ -8,11 +8,6 @@
 #include <QDir>
 #include <QCoreApplication>
 
-extern "C" {
-#include <ccnet/ccnet-client.h>
-}
-
-
 #include "utils/utils.h"
 #include "utils/process.h"
 #include "configurator.h"
@@ -23,19 +18,49 @@ extern "C" {
 namespace {
 
 const int kConnDaemonIntervalMilli = 1000;
+const int kMaxDaemonReadyCheck = 15;
+
+const int kDaemonRestartInternvalMSecs = 2000;
+const int kDaemonRestartMaxRetries = 10;
 
 #if defined(Q_OS_WIN32)
-const char *kCcnetDaemonExecutable = "ccnet.exe";
 const char *kSeafileDaemonExecutable = "seaf-daemon.exe";
 #else
-const char *kCcnetDaemonExecutable = "ccnet";
 const char *kSeafileDaemonExecutable = "seaf-daemon";
 #endif
 
+typedef enum {
+    DAEMON_INIT = 0,
+    DAEMON_STARTING,
+    DAEMON_CONNECTING,
+    DAEMON_CONNECTED,
+    DAEMON_DEAD,
+    SEAFILE_EXITING,
+    MAX_STATE,
+} DaemonState;
+
+const char *DaemonStateStrs[] = {
+    "init",
+    "starting",
+    "connecting",
+    "connected",
+    "dead",
+    "seafile_exiting"
+};
+
+const char *stateToStr(int state)
+{
+    if (state < 0 || state >= MAX_STATE) {
+        return "";
+    }
+    return DaemonStateStrs[state];
+}
 
 bool seafileRpcReady() {
     SeafileRpcClient rpc;
-    rpc.connectDaemon();
+    if (!rpc.tryConnectDaemon()) {
+        return false;
+    }
 
     QString str;
     return rpc.seafileGetConfig("use_proxy", &str) == 0;
@@ -47,143 +72,140 @@ bool seafileRpcReady() {
 
 
 DaemonManager::DaemonManager()
-    : ccnet_daemon_(0),
-    seaf_daemon_(0),
-    sync_client_(0)
+    : seaf_daemon_(nullptr)
 {
+    current_state_ = DAEMON_INIT;
+    first_start_ = true;
+    restart_retried_ = 0;
+
     conn_daemon_timer_ = new QTimer(this);
-    connect(conn_daemon_timer_, SIGNAL(timeout()), this, SLOT(tryConnCcnet()));
-    shutdown_process (kCcnetDaemonExecutable);
+    connect(conn_daemon_timer_, SIGNAL(timeout()), this, SLOT(checkDaemonReady()));
 
-    check_seaf_daemon_ready_timer_ = new QTimer(this);
-    connect(check_seaf_daemon_ready_timer_, SIGNAL(timeout()), this, SLOT(checkSeafDaemonReady()));
-
-    system_shut_down_ = false;
     connect(qApp, SIGNAL(aboutToQuit()),
             this, SLOT(systemShutDown()));
 }
 
 DaemonManager::~DaemonManager() {
-    stopAllDaemon();
+    stopDaemon();
 }
 
-void DaemonManager::startCcnetDaemon()
+void DaemonManager::restartSeafileDaemon()
 {
-    sync_client_ = ccnet_client_new();
-
-    const QString config_dir = seafApplet->configurator()->ccnetDir();
-    const QByteArray path = config_dir.toUtf8();
-    if (ccnet_client_load_confdir(sync_client_, NULL, path.data()) <  0) {
-        seafApplet->errorAndExit(tr("failed to load ccnet config dir %1").arg(config_dir));
+    if (current_state_ == SEAFILE_EXITING) {
+        return;
     }
 
-    ccnet_daemon_ = new QProcess(this);
-    connect(ccnet_daemon_, SIGNAL(started()), this, SLOT(onCcnetDaemonStarted()));
-    connect(ccnet_daemon_, SIGNAL(finished(int, QProcess::ExitStatus)),
-            this, SLOT(onCcnetDaemonExited()));
-
-    QStringList args;
-    args << "-c" << config_dir;
-    ccnet_daemon_->start(RESOURCE_PATH(kCcnetDaemonExecutable), args);
-    qWarning() << "starting ccnet: " << args;
+    qWarning("Trying to restart seafile daemon");
+    startSeafileDaemon();
 }
 
 void DaemonManager::startSeafileDaemon()
 {
+    seaf_daemon_ = new QProcess(this);
+    connect(seaf_daemon_, SIGNAL(started()), this, SLOT(onDaemonStarted()));
+    connect(seaf_daemon_, SIGNAL(finished(int, QProcess::ExitStatus)),
+            SLOT(onDaemonFinished(int, QProcess::ExitStatus)));
+
     const QString config_dir = seafApplet->configurator()->ccnetDir();
     const QString seafile_dir = seafApplet->configurator()->seafileDir();
     const QString worktree_dir = seafApplet->configurator()->worktreeDir();
-
-    seaf_daemon_ = new QProcess(this);
-    connect(seaf_daemon_, SIGNAL(started()), this, SLOT(onSeafDaemonStarted()));
-    connect(seaf_daemon_, SIGNAL(finished(int, QProcess::ExitStatus)),
-            this, SLOT(onSeafDaemonExited()));
 
     QStringList args;
     args << "-c" << config_dir << "-d" << seafile_dir << "-w" << worktree_dir;
     seaf_daemon_->start(RESOURCE_PATH(kSeafileDaemonExecutable), args);
     qWarning() << "starting seaf-daemon: " << args;
-}
-
-void DaemonManager::onCcnetDaemonStarted()
-{
-    conn_daemon_timer_->start(kConnDaemonIntervalMilli);
+    transitionState(DAEMON_STARTING);
 }
 
 void DaemonManager::systemShutDown()
 {
-    system_shut_down_ = true;
+    transitionState(SEAFILE_EXITING);
 }
 
-void DaemonManager::onSeafDaemonStarted()
+void DaemonManager::onDaemonStarted()
 {
     qDebug("seafile daemon is now running, checking if the service is ready");
-    check_seaf_daemon_ready_timer_->start(kConnDaemonIntervalMilli);
+    conn_daemon_timer_->start(kConnDaemonIntervalMilli);
+    transitionState(DAEMON_CONNECTING);
 }
 
-void DaemonManager::checkSeafDaemonReady()
+void DaemonManager::checkDaemonReady()
 {
     QString str;
     // Because some settings need to be loaded from seaf daemon, we only emit
     // the "daemonStarted" signal after we're sure the daemon rpc is ready.
     if (seafileRpcReady()) {
         qDebug("seaf daemon is ready");
-        check_seaf_daemon_ready_timer_->stop();
-        emit daemonStarted();
+        conn_daemon_timer_->stop();
+        transitionState(DAEMON_CONNECTED);
+        restart_retried_ = 0;
+        if (first_start_) {
+            first_start_ = false;
+            emit daemonStarted();
+        } else {
+            emit daemonRestarted();
+        }
         return;
     }
     qDebug("seaf daemon is not ready");
     static int maxcheck = 0;
-    if (++maxcheck > 15) {
+    if (++maxcheck > kMaxDaemonReadyCheck) {
         qWarning("seafile rpc is not ready after %d retry, abort", maxcheck);
         seafApplet->errorAndExit(tr("%1 client failed to initialize").arg(getBrand()));
     }
 }
 
-void DaemonManager::onCcnetDaemonExited()
+void DaemonManager::onDaemonFinished(int exit_code, QProcess::ExitStatus exit_status)
 {
-    // if (!system_shut_down_) {
-    //     seafApplet->errorAndExit(tr("ccnet daemon has exited abnormally"));
-    // }
-}
+    qWarning("Seafile daemon process %s with code %d ",
+             (current_state_ != SEAFILE_EXITING &&
+              exit_status == QProcess::CrashExit)
+                 ? "crashed"
+                 : "exited normally",
+             exit_code);
 
-void DaemonManager::onSeafDaemonExited()
-{
-    // if (!system_shut_down_) {
-    //     seafApplet->errorAndExit(tr("seafile daemon has exited abnormally"));
-    // }
-}
 
-void DaemonManager::stopAllDaemon()
-{
-    qWarning("[Daemon Mgr] stopping ccnet/seafile daemon");
-
-    if (conn_daemon_timer_)
+    if (current_state_ == DAEMON_CONNECTING) {
         conn_daemon_timer_->stop();
-    if (check_seaf_daemon_ready_timer_) {
-        check_seaf_daemon_ready_timer_->stop();
+        scheduleRestartDaemon();
+    } else if (current_state_ != SEAFILE_EXITING) {
+        transitionState(DAEMON_DEAD);
+        emit daemonDead();
+        scheduleRestartDaemon();
     }
+}
+
+void DaemonManager::stopDaemon()
+{
+    conn_daemon_timer_->stop();
     if (seaf_daemon_) {
+        qWarning("[Daemon Mgr] stopping seafile daemon");
+        // TODO: add an "exit" rpc in seaf-daemon to exit gracefully?
         seaf_daemon_->kill();
         seaf_daemon_->waitForFinished(50);
-    }
-    if (ccnet_daemon_) {
-        ccnet_daemon_->kill();
-        ccnet_daemon_->waitForFinished(10);
+        seaf_daemon_ = nullptr;
     }
 }
 
-void DaemonManager::tryConnCcnet()
+void DaemonManager::scheduleRestartDaemon()
 {
-    qWarning("trying to connect to ccnet daemon...\n");
-
-    if (ccnet_client_connect_daemon(sync_client_, CCNET_CLIENT_SYNC) < 0) {
-        return;
-    } else {
-        conn_daemon_timer_->stop();
-
-        qWarning("connected to ccnet daemon\n");
-
-        startSeafileDaemon();
+    // When the daemon crashes when we first start seafile, we should
+    // not retry too many times, because during the retry nothing
+    // would be shown to the user and would confuse him.
+    int max_retry = 2;
+    if (seafApplet->rpcClient() && seafApplet->rpcClient()->isConnected()) {
+        max_retry = kDaemonRestartMaxRetries;
     }
+    if (++restart_retried_ >= max_retry) {
+        qWarning("reaching max tries of restarting seafile daemon, aborting");
+        seafApplet->errorAndExit(tr("%1 exited unexpectedly").arg(getBrand()));
+        return;
+    }
+    QTimer::singleShot(kDaemonRestartInternvalMSecs, this, SLOT(restartSeafileDaemon()));
+}
+
+void DaemonManager::transitionState(int new_state)
+{
+    qDebug("daemon mgr: %s => %s", stateToStr(current_state_), stateToStr(new_state));
+    current_state_ = new_state;
 }

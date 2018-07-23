@@ -27,6 +27,7 @@ enum {
     FILE_MAX_COLUMN
 };
 
+int kMarginLeft = 9;
 const int kDefaultColumnWidth = 120;
 const int kDefaultColumnHeight = 40;
 const int kColumnIconSize = 28;
@@ -34,16 +35,19 @@ const int kFileNameColumnWidth = 200;
 const int kExtraPadding = 30;
 const int kDefaultColumnSum = kFileNameColumnWidth + kDefaultColumnWidth * 3 + kExtraPadding;
 const int kLockIconSize = 16;
+const int kFileStatusIconSize = 16;
+const int kMarginBetweenFileNameAndStatusIcon = 5;
 
 const int kRefreshProgressInterval = 1000;
 
 const QColor kSelectedItemBackgroundcColor("#F9E0C7");
 const QColor kItemBackgroundColor("white");
-const QColor kItemBottomBorderColor("#f3f3f3");
-const QColor kItemColor("black");
+const QColor kItemBottomBorderColor("#ECECEC");
+const QColor kFileNameFontColor("black");
+const QColor kFontColor("#757575");
 const QString kProgressBarStyle("QProgressBar "
         "{ border: 1px solid grey; border-radius: 2px; } "
-        "QProgressBar::chunk { background-color: #f0f0f0; width: 20px; }");
+        "QProgressBar::chunk { background-color: #f0f0f0; width: 1px; }");
 
 enum {
     NOT_LOCKED = 0,
@@ -52,7 +56,27 @@ enum {
 };
 
 const int DirentLockStatusRole = Qt::UserRole + 1;
-const int DirentLockOwnerRoler = Qt::UserRole + 2;
+const int DirentLockOwnerRole = Qt::UserRole + 2;
+const int DirentCacheStatusRole = Qt::UserRole + 3;
+
+QIcon getFileStatusIcon(AutoUpdateManager::FileStatus file_status)
+{
+    QString icon;
+    const QString prefix = ":/images/sync/";
+    switch (file_status) {
+        case AutoUpdateManager::SYNCED:
+            icon = "status-done";
+            break;
+        case AutoUpdateManager::UPLOADING:
+            icon = "status-syncing";
+            break;
+        case AutoUpdateManager::NOT_SYNCED:
+            icon = "exclamation";
+            break;
+    }
+
+    return QIcon(prefix + icon + ".png");
+}
 
 } // namespace
 
@@ -66,14 +90,6 @@ void FileTableViewDelegate::paint(QPainter *painter, const QStyleOptionViewItem 
 
     // fix for the last item
     QRect option_rect = option.rect;
-    if (index.column() == FILE_COLUMN_KIND) {
-        option_rect.setSize(option_rect.size() - QSize(13, 0));
-        // white the extra rect
-        const QRect last_rect = QRect(option_rect.topRight(), QSize(13, option_rect.height()));
-        painter->save();
-        painter->fillRect(last_rect, kItemBackgroundColor);
-        painter->restore();
-    }
 
     // draw item's background
     painter->save();
@@ -112,7 +128,7 @@ void FileTableViewDelegate::paint(QPainter *painter, const QStyleOptionViewItem 
     {
         // draw icon
         QPixmap pixmap = model->data(index, Qt::DecorationRole).value<QPixmap>();
-        int scale_factor = devicePixelRatio();
+        double scale_factor = globalDevicePixelRatio();
         // On Mac OSX (and other HDPI screens) the pixmap would be the 2x
         // version (but the draw rect area is still the same size), so when
         // computing the offsets we need to divide it by the scale factor.
@@ -123,8 +139,12 @@ void FileTableViewDelegate::paint(QPainter *painter, const QStyleOptionViewItem 
         int alignX = (kColumnIconSize - icon_width) / 2;
         int alignY = (size.height() - icon_height) / 2;
 
+#ifdef Q_OS_WIN32
+    kMarginLeft = 4;
+#endif
+
         QRect icon_bound_rect(
-            option_rect.topLeft() + QPoint(alignX, alignY - 2),
+            option_rect.topLeft() + QPoint(kMarginLeft + alignX, alignY - 2),
             QSize(icon_width, icon_height));
 
         painter->save();
@@ -139,18 +159,39 @@ void FileTableViewDelegate::paint(QPainter *painter, const QStyleOptionViewItem 
             QPixmap locked_pixmap = QIcon(image).pixmap(kLockIconSize, kLockIconSize);
             int alignX = (kColumnIconSize / 2) + 3;
             int alignY = (kColumnIconSize / 2) + 2;
-            painter->drawPixmap(option_rect.topLeft() + QPoint(alignX, alignY), locked_pixmap);
+            painter->drawPixmap(option_rect.topLeft() + QPoint(kMarginLeft + alignX, alignY), locked_pixmap);
             painter->restore();
         }
 
         // draw text
         QFont font = model->data(index, Qt::FontRole).value<QFont>();
-        QRect rect(option_rect.topLeft() + QPoint(4 * 2 + kColumnIconSize, -2), size - QSize(kColumnIconSize, 0));
-        painter->setPen(kItemColor);
+        QRect rect(option_rect.topLeft() + QPoint(kMarginLeft + 2 * 2 + kColumnIconSize, -2),
+                   size - QSize(kColumnIconSize + kMarginLeft, 0));
+        painter->setPen(kFileNameFontColor);
         painter->setFont(font);
-        painter->drawText(rect,
-                          Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine,
-                          fitTextToWidth(text, option.font, rect.width() - 20));
+        painter->drawText(
+            rect,
+            Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine,
+            fitTextToWidth(
+                text,
+                option.font,
+                rect.width() - kMarginBetweenFileNameAndStatusIcon - kFileStatusIconSize - 5));
+
+        QVariant file_status_v = model->data(index, DirentCacheStatusRole);
+        if (!file_status_v.isNull()) {
+            AutoUpdateManager::FileStatus file_status = (AutoUpdateManager::FileStatus)file_status_v.toInt();
+            // printf ("file status is %d\n", (int)file_status);
+
+            QPoint status_icon_pos = option.rect.topRight() - QPoint(kFileStatusIconSize + 3, 0);
+            status_icon_pos.setY(option.rect.center().y() - (kFileStatusIconSize / 2));
+            QRect status_icon_rect(status_icon_pos, QSize(kFileStatusIconSize, kFileStatusIconSize));
+
+            QPixmap status_icon_pixmap = getFileStatusIcon(file_status).pixmap(status_icon_rect.size());
+
+            painter->save();
+            painter->drawPixmap(status_icon_rect, status_icon_pixmap);
+            painter->restore();
+        }
     }
     break;
     case FILE_COLUMN_SIZE:
@@ -193,9 +234,9 @@ void FileTableViewDelegate::paint(QPainter *painter, const QStyleOptionViewItem 
             text = model->data(index, Qt::UserRole).toString();
         }
         QFont font = model->data(index, Qt::FontRole).value<QFont>();
-        QRect rect(option_rect.topLeft() + QPoint(4, -2), size - QSize(10, 0));
+        QRect rect(option_rect.topLeft() + QPoint(9, -2), size - QSize(10, 0));
         painter->save();
-        painter->setPen(kItemColor);
+        painter->setPen(kFontColor);
         painter->setFont(font);
         painter->drawText(rect, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine, text);
         painter->restore();
@@ -219,7 +260,7 @@ FileTableView::FileTableView(QWidget *parent)
       proxy_model_(NULL)
 {
     verticalHeader()->hide();
-    verticalHeader()->setDefaultSectionSize(36);
+    verticalHeader()->setDefaultSectionSize(kDefaultColumnHeight);
     horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     horizontalHeader()->setStretchLastSection(true);
     horizontalHeader()->setCascadingSectionResizes(true);
@@ -236,7 +277,6 @@ FileTableView::FileTableView(QWidget *parent)
     setSelectionMode(QAbstractItemView::ExtendedSelection);
 
     setMouseTracking(true);
-    setAcceptDrops(true);
     setDragDropMode(QAbstractItemView::DropOnly);
     setItemDelegate(new FileTableViewDelegate(this));
 
@@ -289,11 +329,16 @@ void FileTableView::setupContextMenu()
     context_menu_ = new QMenu(this);
     connect(parent_, SIGNAL(aboutToClose()),
             context_menu_, SLOT(close()));
-    download_action_ = new QAction(tr("&Open"), this);
-    connect(download_action_, SIGNAL(triggered()),
-            this, SLOT(onOpen()));
-    download_action_->setShortcut(QKeySequence::InsertParagraphSeparator);
 
+    retry_upload_cached_file_action_ = new QAction(tr("Retry Upload"), this);
+    connect(retry_upload_cached_file_action_, SIGNAL(triggered()),
+            this, SLOT(onRetryUploadCachedFile()));
+    delete_local_version_action_ = new QAction(tr("Delete Local Version"), this);
+    connect(delete_local_version_action_, SIGNAL(triggered()),
+            this, SLOT(onDeleteLocalVersion()));
+    local_version_saveas_action_ = new QAction(tr("Local Version Save As..."), this);
+    connect(local_version_saveas_action_, SIGNAL(triggered()),
+            this, SLOT(onLocalVersionSaveAs()));
     saveas_action_ = new QAction(tr("&Save As..."), this);
     connect(saveas_action_, SIGNAL(triggered()),
             this, SLOT(onSaveAs()));
@@ -315,7 +360,7 @@ void FileTableView::setupContextMenu()
     remove_action_ = new QAction(tr("&Delete"), this);
     connect(remove_action_, SIGNAL(triggered()),
             this, SLOT(onRemove()));
-    remove_action_->setShortcut(QKeySequence::Delete);
+    // remove_action_->setShortcut(QKeySequence::Delete);
 
     share_action_ = new QAction(tr("&Generate %1 Download Link").arg(getBrand()), this);
     connect(share_action_, SIGNAL(triggered()),
@@ -337,6 +382,8 @@ void FileTableView::setupContextMenu()
 
     if (parent_->repo_.encrypted) {
         share_action_->setEnabled(false);
+        share_to_user_action_->setEnabled(false);
+        share_to_group_action_->setEnabled(false);
     }
 
     update_action_ = new QAction(tr("&Update"), this);
@@ -368,14 +415,20 @@ void FileTableView::setupContextMenu()
     sync_subdirectory_action_ = new QAction(tr("&Sync this folder"), this);
     connect(sync_subdirectory_action_, SIGNAL(triggered()),
             this, SLOT(onSyncSubdirectory()));
-    sync_subdirectory_action_->setShortcut(Qt::ALT + Qt::Key_S);
+    // sync_subdirectory_action_->setShortcut(Qt::ALT + Qt::Key_S);
     if (!parent_->account_.isAtLeastVersion(4, 1, 0)) {
         sync_subdirectory_action_->setEnabled(false);
         sync_subdirectory_action_->setToolTip(tr("This feature is available in pro version only\n"));
     }
 
-    context_menu_->setDefaultAction(download_action_);
-    context_menu_->addAction(download_action_);
+    open_local_cache_folder_action_ = new QAction(tr("Open Local Cache Folder"), this);
+    connect(open_local_cache_folder_action_, SIGNAL(triggered()),
+                this, SLOT(onOpenLocalCacheFolder()));
+
+    context_menu_->addAction(retry_upload_cached_file_action_);
+    context_menu_->addAction(delete_local_version_action_);
+    context_menu_->addAction(local_version_saveas_action_);
+    context_menu_->addSeparator();
     context_menu_->addAction(saveas_action_);
     context_menu_->addAction(share_action_);
     context_menu_->addAction(share_seafile_action_);
@@ -390,11 +443,15 @@ void FileTableView::setupContextMenu()
     context_menu_->addAction(rename_action_);
     context_menu_->addAction(remove_action_);
     context_menu_->addSeparator();
-    context_menu_->addAction(update_action_);
+    // context_menu_->addAction(update_action_);
     context_menu_->addAction(cancel_download_action_);
     context_menu_->addAction(sync_subdirectory_action_);
+    context_menu_->addSeparator();
+    context_menu_->addAction(open_local_cache_folder_action_);
 
-    this->addAction(download_action_);
+    this->addAction(retry_upload_cached_file_action_);
+    this->addAction(delete_local_version_action_);
+    this->addAction(local_version_saveas_action_);
     this->addAction(saveas_action_);
     this->addAction(share_action_);
     this->addAction(share_seafile_action_);
@@ -404,9 +461,10 @@ void FileTableView::setupContextMenu()
     this->addAction(lock_action_);
     this->addAction(rename_action_);
     this->addAction(remove_action_);
-    this->addAction(update_action_);
+    // this->addAction(update_action_);
     this->addAction(cancel_download_action_);
     this->addAction(sync_subdirectory_action_);
+    this->addAction(open_local_cache_folder_action_);
 
     paste_only_menu_ = new QMenu(this);
     paste_only_menu_->addAction(paste_action_);
@@ -418,10 +476,25 @@ void FileTableView::contextMenuEvent(QContextMenuEvent *event)
     const QModelIndex proxy_index = indexAt(position);
     position = viewport()->mapToGlobal(position);
 
+    retry_upload_cached_file_action_->setVisible(false);
+    delete_local_version_action_->setVisible(false);
+    local_version_saveas_action_->setVisible(false);
+    open_local_cache_folder_action_->setEnabled(false);
+
+    //
+    // paste_action shows only if there are files in the clipboard
+    // and is enabled only if it comes from the same account
+    //
+    paste_action_->setVisible(parent_->hasFilesToBePasted());
+
     //
     // show paste only menu for no items
     // paste-dedicated menu
     //
+    paste_action_->setEnabled(!parent_->current_readonly_ &&
+                              parent_->account_to_be_pasted_from_ ==
+                                  parent_->account_ &&
+                              parent_->hasFilesToBePasted());
     if (!proxy_index.isValid()) {
         if (parent_->hasFilesToBePasted()) {
             paste_only_menu_->exec(position);
@@ -429,13 +502,7 @@ void FileTableView::contextMenuEvent(QContextMenuEvent *event)
         return;
     }
 
-    //
-    // paste_action shows only if there are files in the clipboard
-    // and is enabled only if it comes from the same account
-    //
-    paste_action_->setVisible(parent_->hasFilesToBePasted());
-    paste_action_->setEnabled(!parent_->current_readonly_ &&
-        parent_->account_to_be_pasted_from_ == parent_->account_);
+    // printf ("paste action enabled: %s\n", paste_action_->isEnabled() ? "true": "false");
 
     //
     // map back to the source index from FileTableModel
@@ -476,17 +543,16 @@ void FileTableView::contextMenuEvent(QContextMenuEvent *event)
             }
         }
 
-        download_action_->setVisible(!has_dir);
         saveas_action_->setText(tr("&Save As To..."));
+        saveas_action_->setVisible(true);
         saveas_action_->setEnabled(!has_dir);
-        download_action_->setText(tr("D&ownload"));
         lock_action_->setVisible(false);
         rename_action_->setVisible(false);
         share_action_->setVisible(false);
         share_seafile_action_->setVisible(false);
         share_to_user_action_->setVisible(false);
         share_to_group_action_->setVisible(false);
-        update_action_->setVisible(false);
+        // update_action_->setVisible(false);
         cancel_download_action_->setVisible(false);
         sync_subdirectory_action_->setVisible(false);
 
@@ -505,30 +571,28 @@ void FileTableView::contextMenuEvent(QContextMenuEvent *event)
     item_.reset(new SeafDirent(*dirent));
 
     saveas_action_->setText(tr("&Save As..."));
+    saveas_action_->setVisible(true);
     rename_action_->setVisible(true);
     share_action_->setVisible(true);
     share_seafile_action_->setVisible(true);
-    update_action_->setVisible(true);
+    // update_action_->setVisible(true);
     cancel_download_action_->setVisible(true);
-    download_action_->setVisible(true);
-    download_action_->setEnabled(true);
     cancel_download_action_->setVisible(false);
     if (item_->readonly) {
         move_action_->setEnabled(false);
         rename_action_->setEnabled(false);
-        update_action_->setEnabled(false);
+        // update_action_->setEnabled(false);
         remove_action_->setEnabled(false);
     } else {
         move_action_->setEnabled(true);
         rename_action_->setEnabled(true);
-        update_action_->setEnabled(true);
+        // update_action_->setEnabled(true);
         remove_action_->setEnabled(true);
     }
 
     if (item_->isDir()) {
         lock_action_->setVisible(false);
-        update_action_->setVisible(false);
-        download_action_->setText(tr("&Open"));
+        // update_action_->setVisible(false);
         saveas_action_->setEnabled(false);
         sync_subdirectory_action_->setVisible(true);
         share_to_user_action_->setVisible(true);
@@ -537,15 +601,23 @@ void FileTableView::contextMenuEvent(QContextMenuEvent *event)
         if (item_->locked_by_me) {
             lock_action_->setText(tr("Un&lock"));
             lock_action_->setVisible(true);
+            move_action_->setEnabled(true);
+            remove_action_->setEnabled(true);
+            rename_action_->setEnabled(true);
         } else if (item_->is_locked || item_->readonly) {
             lock_action_->setVisible(false);
+            move_action_->setEnabled(false);
+            remove_action_->setEnabled(false);
+            rename_action_->setEnabled(false);
         } else {
             lock_action_->setText(tr("&Lock"));
             lock_action_->setVisible(true);
+            move_action_->setEnabled(true);
+            remove_action_->setEnabled(true);
+            rename_action_->setEnabled(true);
         }
 
-        update_action_->setVisible(true);
-        download_action_->setText(tr("D&ownload"));
+        // update_action_->setVisible(true);
         saveas_action_->setEnabled(true);
         sync_subdirectory_action_->setVisible(false);
         share_to_user_action_->setVisible(false);
@@ -554,7 +626,6 @@ void FileTableView::contextMenuEvent(QContextMenuEvent *event)
         if (TransferManager::instance()->getDownloadTask(parent_->repo_.id,
             ::pathJoin(parent_->current_path_, dirent->name))) {
             cancel_download_action_->setVisible(true);
-            download_action_->setVisible(false);
             saveas_action_->setVisible(false);
         }
     }
@@ -563,6 +634,20 @@ void FileTableView::contextMenuEvent(QContextMenuEvent *event)
         parent_->repo_.owner != parent_->account_.username) {
         share_to_user_action_->setVisible(false);
         share_to_group_action_->setVisible(false);
+    }
+
+    QVariant file_status_v = source_model_->data(index, DirentCacheStatusRole);
+    AutoUpdateManager::FileStatus file_status = (AutoUpdateManager::FileStatus)file_status_v.toInt();
+    if (file_status == AutoUpdateManager::NOT_SYNCED) {
+        retry_upload_cached_file_action_->setVisible(true);
+        delete_local_version_action_->setVisible(true);
+        local_version_saveas_action_->setVisible(true);
+    }
+
+    QString localpath = DataManager::getLocalCacheFilePath(
+        parent_->repo_.id, ::pathJoin(parent_->current_path_, dirent->name));
+    if (QFileInfo(localpath).exists()) {
+        open_local_cache_folder_action_->setEnabled(true);
     }
 
     context_menu_->exec(position); // synchronously
@@ -589,28 +674,32 @@ void FileTableView::onItemDoubleClicked(const QModelIndex& index)
     emit direntClicked(*dirent);
 }
 
-void FileTableView::onOpen()
+void FileTableView::onRetryUploadCachedFile()
 {
-    if (item_ == NULL) {
-        const QList<const SeafDirent*> dirents = getSelectedItemsFromSource();
-        // if we are going to open a directory
-        if (dirents.size() == 1 &&
-            dirents.front()->isDir()) {
-            emit direntClicked(*dirents.front());
-            return;
-        }
-        // in other cases, download files only
-        for (int i = 0; i < dirents.size(); i++) {
-            // ignore directories since we have no support for them
-            if (dirents[i]->isDir())
-                continue;
+    const SeafDirent *dirent = getSelectedItemFromSource();
+    parent_->onGetDirentReupload(*dirent);
+}
 
-            emit direntClicked(*dirents[i]);
-        }
+void FileTableView::onDeleteLocalVersion()
+{
+    const SeafDirent *dirent = getSelectedItemFromSource();
+
+    if (dirent == NULL) {
         return;
     }
 
-    emit direntClicked(*item_);
+    emit deleteLocalVersion(*dirent);
+}
+
+void FileTableView::onLocalVersionSaveAs()
+{
+    const SeafDirent *dirent = getSelectedItemFromSource();
+
+    if (dirent == NULL) {
+        return;
+    }
+
+    emit localVersionSaveAs(*dirent);
 }
 
 void FileTableView::onSaveAs()
@@ -797,53 +886,9 @@ void FileTableView::onSyncSubdirectory()
         emit syncSubdirectory(item_->name);
 }
 
-void FileTableView::dropEvent(QDropEvent *event)
+void FileTableView::onOpenLocalCacheFolder()
 {
-    // only handle external source currently
-    if(event->source() != NULL)
-        return;
-
-    QList<QUrl> urls = event->mimeData()->urls();
-
-    if(urls.isEmpty())
-        return;
-
-    QStringList paths;
-    Q_FOREACH(const QUrl& url, urls)
-    {
-        QString path = url.toLocalFile();
-#if defined(Q_OS_MAC) && (QT_VERSION <= QT_VERSION_CHECK(5, 4, 0))
-        path = utils::mac::fix_file_id_url(path);
-#endif
-
-        if(path.isEmpty())
-            continue;
-        paths.push_back(path);
-    }
-
-    event->accept();
-
-    emit dropFile(paths);
-}
-
-void FileTableView::dragMoveEvent(QDragMoveEvent *event)
-{
-    // this is needed
-    event->accept();
-}
-
-void FileTableView::dragEnterEvent(QDragEnterEvent *event)
-{
-    // only handle external source currently
-    if(event->source() != NULL)
-        return;
-
-    // Otherwise it might be a MoveAction which is unacceptable
-    event->setDropAction(Qt::CopyAction);
-
-    // trivial check
-    if(event->mimeData()->hasFormat("text/uri-list"))
-        event->accept();
+    parent_->onOpenLocalCacheFolder();
 }
 
 void FileTableView::resizeEvent(QResizeEvent *event)
@@ -860,6 +905,8 @@ FileTableModel::FileTableModel(QObject *parent)
     task_progress_timer_ = new QTimer(this);
     connect(task_progress_timer_, SIGNAL(timeout()),
             this, SLOT(updateDownloadInfo()));
+    connect(task_progress_timer_, SIGNAL(timeout()),
+            this, SLOT(updateFileCacheStatus()));
     connect(ThumbnailService::instance(), SIGNAL(thumbnailUpdated(const QPixmap&, const QString&)),
             this, SLOT(updateThumbnail(const QPixmap &, const QString&)));
     task_progress_timer_->start(kRefreshProgressInterval);
@@ -870,7 +917,12 @@ void FileTableModel::setDirents(const QList<SeafDirent>& dirents)
     beginResetModel();
     dirents_ = dirents;
     progresses_.clear();
+    file_cache_statuses_.clear();
     endResetModel();
+
+    updateFileCacheStatus();
+    updateDownloadInfo();
+    task_progress_timer_->start();
 }
 
 int FileTableModel::rowCount(const QModelIndex& parent) const
@@ -907,7 +959,7 @@ QVariant FileTableModel::data(const QModelIndex & index, int role) const
                 dialog->repo_.id,
                 ::pathJoin(dialog->current_path_, dirent.name),
                 dirent.id,
-                kColumnIconSize * devicePixelRatio());
+                kColumnIconSize * globalDevicePixelRatio());
         } else {
             icon = QIcon(getIconByFileNameV2(dirent.name));
         }
@@ -943,12 +995,18 @@ QVariant FileTableModel::data(const QModelIndex & index, int role) const
             return NOT_LOCKED;
     }
 
-    if (role == DirentLockOwnerRoler && column == FILE_COLUMN_NAME) {
+    if (role == DirentLockOwnerRole && column == FILE_COLUMN_NAME) {
         return dirent.lock_owner;
     }
 
     if (role == Qt::ToolTipRole && column == FILE_COLUMN_NAME && !dirent.lock_owner.isEmpty()) {
-        return tr("locked by %1").arg(dirent.lock_owner);
+        return tr("locked by %1").arg(dirent.getLockOwnerDisplayString());
+    }
+
+    if (role == DirentCacheStatusRole) {
+        return file_cache_statuses_.contains(dirent.name)
+                   ? (int)file_cache_statuses_[dirent.name]
+                   : QVariant();
     }
 
     if (role != Qt::DisplayRole) {
@@ -985,27 +1043,46 @@ QVariant FileTableModel::headerData(int section,
                                     Qt::Orientation orientation,
                                     int role) const
 {
-    if (orientation == Qt::Vertical)
-        return QVariant();
-
-    if (role == Qt::TextAlignmentRole)
-        return Qt::AlignLeft + Qt::AlignVCenter;
-
-    if (role != Qt::DisplayRole)
-        return QVariant();
-
-    switch (section) {
-    case FILE_COLUMN_NAME:
-        return tr("Name");
-    case FILE_COLUMN_SIZE:
-        return tr("Size");
-    case FILE_COLUMN_MTIME:
-        return tr("Last Modified");
-    case FILE_COLUMN_KIND:
-        return tr("Kind");
-    default:
+    if (orientation == Qt::Vertical) {
         return QVariant();
     }
+
+    if (role == Qt::TextAlignmentRole) {
+        return Qt::AlignLeft + Qt::AlignVCenter;
+    }
+
+    if (role == Qt::DisplayRole) {
+        switch (section) {
+        case FILE_COLUMN_NAME:
+            return tr("Name");
+        case FILE_COLUMN_SIZE:
+            return tr("Size");
+        case FILE_COLUMN_MTIME:
+            return tr("Last Modified");
+        case FILE_COLUMN_KIND:
+            return tr("Kind");
+        default:
+            return QVariant();
+        }
+    }
+
+    if (role == Qt::FontRole) {
+        QFont font;
+        font.setPixelSize(12);
+        return font;
+    }
+
+    if (role == Qt::ForegroundRole) {
+        return QBrush(kFontColor);
+    }
+
+    if (role == Qt::SizeHintRole && section == FILE_COLUMN_NAME) {
+        if (dirents_.empty()) {
+            return QSize(name_column_width_, 0);
+        }
+    }
+
+    return QVariant();
 }
 
 const SeafDirent* FileTableModel::direntAt(int row) const
@@ -1085,6 +1162,39 @@ void FileTableModel::updateDownloadInfo()
                      index(dirents_.size() - 1 , FILE_COLUMN_SIZE));
 }
 
+
+void FileTableModel::updateFileCacheStatus()
+{
+    if (dirents_.empty())
+        return;
+
+    FileBrowserDialog *dialog = (FileBrowserDialog *)(QObject::parent());
+    QHash<QString, AutoUpdateManager::FileStatus> new_statues =
+        AutoUpdateManager::instance()->getFileStatusForDirectory(
+            dialog->account_.getSignature(),
+            dialog->repo_.id,
+            dialog->current_path_,
+            dirents_);
+
+    if (new_statues == file_cache_statuses_) {
+        return;
+    }
+
+    for (int pos = 0; pos != dirents_.size() ; pos++) {
+        const QString& name = dirents_[pos].name;
+        int new_status = new_statues.contains(name) ? (int)new_statues[name] : -1;
+        int old_status = file_cache_statuses_.contains(name) ? (int)file_cache_statuses_[name] : -1;
+        if (new_status != old_status) {
+            emit dataChanged(index(pos, FILE_COLUMN_NAME), index(pos , FILE_COLUMN_NAME));
+        }
+    }
+
+    file_cache_statuses_ = new_statues;
+    // printf ("repainting when file cache status is changed\n");
+    // emit dataChanged(index(0, FILE_COLUMN_NAME),
+    //                  index(dirents_.size() - 1 , FILE_COLUMN_NAME));
+}
+
 void FileTableModel::updateThumbnail(const QPixmap& thumbnail, const QString& path)
 {
     const QString name = QFileInfo(path).fileName();
@@ -1099,14 +1209,17 @@ bool FileTableSortFilterProxyModel::lessThan(const QModelIndex &left, const QMod
 {
     bool is_dir_left = source_model_->direntAt(left.row())->isDir();
     bool is_dir_right = source_model_->direntAt(right.row())->isDir();
-    if (is_dir_left != is_dir_right)
+    if (is_dir_left != is_dir_right) {
         return sortOrder() != Qt::AscendingOrder ? is_dir_right
                                                  : !is_dir_right;
-    else {
+    }
+    else if ((left.column() == FILE_COLUMN_NAME) &&
+             (right.column() == FILE_COLUMN_NAME)) {
         const QString left_name = source_model_->direntAt(left.row())->name;
         const QString right_name = source_model_->direntAt(right.row())->name;
-        return digitalCompare(left_name, right_name) < 0 ? true : false;
+        return digitalCompare(left_name, right_name) < 0;
     }
-
-    return QSortFilterProxyModel::lessThan(left, right);
+    else {
+        return QSortFilterProxyModel::lessThan(left, right);
+    }
 }

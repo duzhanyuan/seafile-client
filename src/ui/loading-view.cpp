@@ -9,21 +9,13 @@
 #include "loading-view.h"
 
 LoadingView::LoadingView(QWidget *parent)
-    : QWidget(parent)
+    : QLabel(parent)
 {
-    setObjectName("LoadingView");
-
-    QVBoxLayout *layout = new QVBoxLayout;
-    setLayout(layout);
-
-    gif_ = new QMovie(":/images/loading.gif");
+    gif_ = new QMovie(":/images/loading-spinner.gif");
+    gif_->setScaledSize(QSize(24, 24));
     gif_->setParent(this);
-    QLabel *label = new QLabel;
-    label->setMovie(gif_);
-    label->setAlignment(Qt::AlignCenter);
-
-    layout->addWidget(label);
-    layout->setContentsMargins(0, 0, 0, 0);
+    setMovie(gif_);
+    setAlignment(Qt::AlignCenter);
 }
 
 void LoadingView::showEvent(QShowEvent *event)
@@ -41,9 +33,36 @@ void LoadingView::hideEvent(QHideEvent *event)
 void LoadingView::setQssStyleForTab()
 {
     static const char *kLoadingViewQss = "border: 0; margin: 0;"
-                              "border-top: 1px solid #DCDCDE;"
-                              "background-color: #F5F5F7;";
+                                         "border-top: 1px solid #DCDCDE;"
+                                         "background-color: #F5F5F7;";
 
     setStyleSheet(kLoadingViewQss);
 }
 
+LoadMoreButton::LoadMoreButton(QWidget *parent)
+    : QWidget(parent)
+{
+    load_more_btn_ = new QToolButton;
+    load_more_btn_->setObjectName("loadMoreBtn");
+    load_more_btn_->setText(tr("load more"));
+    btn_layout_ = new QHBoxLayout(this);
+    btn_layout_->addWidget(load_more_btn_, Qt::AlignCenter);
+
+    loading_label_ = new LoadingView;
+
+    // Must set fill backgound because this button is used as an "index widget".
+    // See the doc of QAbstractItemView::setIndexWidget for details.
+    setAutoFillBackground(true);
+
+    connect(load_more_btn_, SIGNAL(clicked()),
+            this, SLOT(onBtnClicked()));
+}
+
+void LoadMoreButton::onBtnClicked()
+{
+    load_more_btn_->hide();
+
+    btn_layout_->addWidget(loading_label_, Qt::AlignCenter);
+
+    emit clicked();
+}

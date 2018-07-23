@@ -15,10 +15,13 @@
 #include <sqlite3.h>
 #include "avatar-service.h"
 
-static const int kCheckPendingInterval = 1000; // 1s
-static const char *kAvatarsDirName = "avatars";
-static const qint64 kExpireTimeIntevalMsec = 300 * 1000; // 5min
-static bool loadTimeStampCB(sqlite3_stmt *stmt, void* data)
+namespace {
+
+const int kCheckPendingInterval = 1000; // 1s
+const char *kAvatarsDirName = "avatars";
+const qint64 kExpireTimeIntevalMsec = 300 * 1000; // 5min
+
+bool loadTimeStampCB(sqlite3_stmt *stmt, void* data)
 {
     qint64* mtime = reinterpret_cast<qint64*>(data);
 
@@ -27,7 +30,10 @@ static bool loadTimeStampCB(sqlite3_stmt *stmt, void* data)
     return true;
 }
 
-const int AvatarService::kAvatarSize = 42;
+} // namespace
+
+const int AvatarService::kAvatarSize = 40;
+const int kAvatarSizeFromServer = 80;
 
 struct PendingRequestInfo {
     int last_wait;
@@ -185,7 +191,7 @@ void AvatarService::start()
             break;
         }
 
-        // create SyncedSubfolder table
+        // create Avatar table
         sql = "CREATE TABLE IF NOT EXISTS Avatar ("
             "filename TEXT PRIMARY KEY, timestamp BIGINT, "
             "url VARCHAR(24), username VARCHAR(15), "
@@ -219,7 +225,9 @@ QImage AvatarService::loadAvatarFromLocal(const QString& email)
 
 QString AvatarService::avatarPathForEmail(const Account& account, const QString& email)
 {
-    return QDir(avatars_dir_).filePath(::md5(account.serverUrl.host() + email));
+    return QDir(avatars_dir_)
+        .filePath(::md5(account.serverUrl.host() + email + "/" +
+                        QString::number(kAvatarSizeFromServer)));
 }
 
 void AvatarService::fetchImageFromServer(const QString& email)
@@ -245,7 +253,7 @@ void AvatarService::fetchImageFromServer(const QString& email)
         sqlite3_free(zql);
     }
 
-    get_avatar_req_ = new GetAvatarRequest(account, email, mtime, devicePixelRatio() * kAvatarSize);
+    get_avatar_req_ = new GetAvatarRequest(account, email, mtime, kAvatarSizeFromServer);
 
     connect(get_avatar_req_, SIGNAL(success(const QImage&)),
             this, SLOT(onGetAvatarSuccess(const QImage&)));
@@ -257,6 +265,10 @@ void AvatarService::fetchImageFromServer(const QString& email)
 
 void AvatarService::onGetAvatarSuccess(const QImage& img)
 {
+    if (!get_avatar_req_) {
+        return;
+    }
+
     const QString email = get_avatar_req_->email();
 
     // if no change? early return
@@ -302,6 +314,9 @@ void AvatarService::onGetAvatarSuccess(const QImage& img)
 
 void AvatarService::onGetAvatarFailed(const ApiError& error)
 {
+    if (!get_avatar_req_) {
+        return;
+    }
     const QString email = get_avatar_req_->email();
     get_avatar_req_->deleteLater();
     get_avatar_req_ = NULL;
@@ -313,6 +328,11 @@ QImage AvatarService::getAvatar(const QString& email)
 {
     QImage img = loadAvatarFromLocal(email);
 
+    // TODO: check the timestamp of the cached avatar and update it if too old,
+    // e.g. cached more than one hour ago. We use timestamps when asking the
+    // server for avatars so updating avatars should be a light weight
+    // operation.
+
     // update all avatars if feature autoupdate enabled or img is null
     if (autoupdate_db_ || img.isNull()) {
         if (!get_avatar_req_ || get_avatar_req_->email() != email) {
@@ -320,7 +340,7 @@ QImage AvatarService::getAvatar(const QString& email)
         }
     }
     if (img.isNull()) {
-        return QImage(devicePixelRatio() > 1 ? ":/images/account@2x.png" :":/images/account.png");
+        return QImage(":/images/account.png");
     } else {
         return img;
     }

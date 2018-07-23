@@ -51,7 +51,7 @@ void FileDownloadHelper::start()
     const QString file_name = QFileInfo(path_).fileName();
     const QString dirent_path = ::getParentPath(path_);
     req_ = new GetDirentsRequest(account_, repo_.id, dirent_path);
-    connect(req_, SIGNAL(success(bool, const QList<SeafDirent> &)),
+    connect(req_, SIGNAL(success(bool, const QList<SeafDirent> &, const QString&)),
             this, SLOT(onGetDirentsSuccess(bool, const QList<SeafDirent> &)));
     connect(req_, SIGNAL(failed(const ApiError &)),
             this, SLOT(onGetDirentsFailure(const ApiError &)));
@@ -90,9 +90,8 @@ void FileDownloadHelper::onGetDirentsSuccess(bool current_readonly, const QList<
 
 void FileDownloadHelper::downloadFile(const QString &id)
 {
-    DataManager data_mgr(account_);
-
-    QString cached_file = data_mgr.getLocalCachedFile(repo_.id, path_, id);
+    DataManager *data_mgr = seafApplet->dataManager();
+    QString cached_file = data_mgr->getLocalCachedFile(repo_.id, path_, id);
     if (!cached_file.isEmpty()) {
         openFile(cached_file, false);
         return;
@@ -100,11 +99,11 @@ void FileDownloadHelper::downloadFile(const QString &id)
 
     // endless loop for setPasswordDialog
     while(true) {
-        FileDownloadTask *task = data_mgr.createDownloadTask(repo_.id, path_);
+        FileDownloadTask *task = data_mgr->createDownloadTask(repo_.id, path_);
         FileBrowserProgressDialog dialog(task, parent_);
         if (dialog.exec()) {
             QString full_path =
-                data_mgr.getLocalCachedFile(repo_.id, path_, task->fileId());
+                data_mgr->getLocalCachedFile(repo_.id, path_, task->fileId());
             if (!full_path.isEmpty())
                 openFile(full_path, true);
             break;
@@ -120,10 +119,10 @@ void FileDownloadHelper::downloadFile(const QString &id)
             // the user canceled the dialog? skip
             break;
         }
+        // printf ("error = %d\n", (int)task->error());
         QString msg =
             QObject::tr("Unable to download item \"%1\"").arg(path_);
         seafApplet->warningBox(msg);
         break;
     }
 }
-

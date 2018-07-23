@@ -20,7 +20,6 @@
 #endif // HAVE_SHIBBOLETH_SUPPORT
 #include "account-settings-dialog.h"
 #include "rpc/rpc-client.h"
-#include "rpc/local-repo.h"
 #include "main-window.h"
 #include "init-vdrive-dialog.h"
 #include "auto-login-service.h"
@@ -30,35 +29,12 @@
 #include "api/api-error.h"
 #include "api/requests.h"
 #include "filebrowser/auto-update-mgr.h"
+#include "repo-service.h"
 
 #include "account-view.h"
 namespace {
 
-QStringList collectSyncedReposForAccount(const Account& account)
-{
-    std::vector<LocalRepo> repos;
-    SeafileRpcClient *rpc = seafApplet->rpcClient();
-    rpc->listLocalRepos(&repos);
-    QStringList repo_ids;
-    for (size_t i = 0; i < repos.size(); i++) {
-        LocalRepo repo = repos[i];
-        QString repo_server_url;
-        if (rpc->getRepoProperty(repo.id, "server-url", &repo_server_url) < 0) {
-            continue;
-        }
-        if (QUrl(repo_server_url).host() != account.serverUrl.host()) {
-            continue;
-        }
-        QString token;
-        if (rpc->getRepoProperty(repo.id, "token", &token) < 0 || token.isEmpty()) {
-            repo_ids.append(repo.id);
-        }
-    }
-
-    return repo_ids;
-}
-
-}
+} // namespace
 
 AccountView::AccountView(QWidget *parent)
     : QWidget(parent)
@@ -80,12 +56,15 @@ AccountView::AccountView(QWidget *parent)
     mAccountBtn->installEventFilter(this);
     account_menu_->installEventFilter(this);
 
-    connect(seafApplet->accountManager(), SIGNAL(accountRequireRelogin(const Account&)),
-            this, SLOT(reloginAccount(const Account &)));
     connect(seafApplet->accountManager(), SIGNAL(requireAddAccount()),
             this, SLOT(showAddAccountDialog()));
     connect(mServerAddr, SIGNAL(linkActivated(const QString&)),
             this, SLOT(visitServerInBrowser(const QString&)));
+
+    // Must get the pixmap from QIcon because QIcon would load the 2x version
+    // automatically.
+    mRefreshLabel->setPixmap(QIcon(":/images/toolbar/refresh-new.png").pixmap(20));
+    mRefreshLabel->installEventFilter(this);
 }
 
 void AccountView::showAddAccountDialog()
@@ -275,34 +254,10 @@ void AccountView::onAccountItemClicked()
     Account account = qvariant_cast<Account>(action->data());
 
     if (!account.isValid()) {
-        reloginAccount(account);
+        seafApplet->accountManager()->reloginAccount(account);
     } else {
         seafApplet->accountManager()->setCurrentAccount(account);
     }
-}
-
-void AccountView::getRepoTokenWhenRelogin(const Account& account)
-{
-    QStringList repo_ids = collectSyncedReposForAccount(account);
-    if (repo_ids.empty()) {
-        return;
-    }
-
-    /* old account object don't contains the new token */
-    QString host = account.serverUrl.host();
-    QString username = account.username;
-    Account new_account = seafApplet->accountManager()->getAccountByHostAndUsername(host, username);
-    if (!new_account.isValid())
-        return;
-
-    GetRepoTokensRequest *req = new GetRepoTokensRequest(
-        new_account, repo_ids);
-
-    connect(req, SIGNAL(success()),
-            this, SLOT(onGetRepoTokensSuccess()));
-    connect(req, SIGNAL(failed(const ApiError&)),
-            this, SLOT(onGetRepoTokensFailed(const ApiError&)));
-    req->send();
 }
 
 void AccountView::updateAvatar()
@@ -315,16 +270,8 @@ void AccountView::updateAvatar()
     }
 
     AvatarService *service = AvatarService::instance();
-
-    if (service->avatarFileExists(account.username)) {
-        QString icon_path = AvatarService::instance()->getAvatarFilePath(account.username);
-        mAccountBtn->setIcon(QIcon(icon_path));
-        return;
-    }
-
-    mAccountBtn->setIcon(QIcon(":/images/account.png"));
-    // will trigger a GetAvatarRequest
-    service->getAvatar(account.username);
+    QIcon avatar = QPixmap::fromImage(service->getAvatar(account.username));
+    mAccountBtn->setIcon(QIcon(avatar));
 }
 
 bool AccountView::eventFilter(QObject *obj, QEvent *event)
@@ -343,12 +290,15 @@ bool AccountView::eventFilter(QObject *obj, QEvent *event)
         painter.setRenderHint(QPainter::HighQualityAntialiasing);
 
         // get the device pixel radio from current painter device
-        int scale_factor = painter.device()->devicePixelRatio();
+        double scale_factor = globalDevicePixelRatio();
 
         QPixmap image(mAccountBtn->icon().pixmap(rect.size()).scaled(scale_factor * rect.size()));
-        QRect actualRect(QPoint(0, 0), image.size());
+        QRect actualRect(QPoint(0, 0),
+                         QSize(AvatarService::kAvatarSize * scale_factor,
+                               AvatarService::kAvatarSize * scale_factor));
 
-        QImage masked_image(actualRect.size(), QImage::Format_ARGB32_Premultiplied);
+        QImage masked_image(actualRect.size(),
+                            QImage::Format_ARGB32_Premultiplied);
         masked_image.fill(Qt::transparent);
         QPainter mask_painter;
         mask_painter.begin(&masked_image);
@@ -369,6 +319,18 @@ bool AccountView::eventFilter(QObject *obj, QEvent *event)
         painter.drawImage(QPoint(0,0), masked_image);
         return true;
     }
+    if (obj == mRefreshLabel) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            emit refresh();
+            return true;
+        } else if (event->type() == QEvent::Enter) {
+            mRefreshLabel->setPixmap(QIcon(":/images/toolbar/refresh-orange.png").pixmap(20));
+            return true;
+        } else if (event->type() == QEvent::Leave) {
+            mRefreshLabel->setPixmap(QIcon(":/images/toolbar/refresh-new.png").pixmap(20));
+            return true;
+        }
+    }
     return QObject::eventFilter(obj, event);
 }
 
@@ -383,90 +345,16 @@ void AccountView::toggleAccount()
         return;
     Account account = qvariant_cast<Account>(action->data());
     if (!account.isValid()) {
-        reloginAccount(account);
+        seafApplet->accountManager()->reloginAccount(account);
         return;
     }
 
+    qWarning("Logging out current account %s", account.username.toUtf8().data());
     AutoUpdateManager::instance()->cleanCachedFile();
 
     // logout Account
     FileBrowserManager::getInstance()->closeAllDialogByAccount(account);
-    LogoutDeviceRequest *req = new LogoutDeviceRequest(account);
-    connect(req, SIGNAL(success()),
-            this, SLOT(onLogoutDeviceRequestSuccess()));
-    connect(req, SIGNAL(failed(const ApiError&)),
-            this, SLOT(onLogoutDeviceRequestFailed(const ApiError&)));
-    req->send();
-}
-
-void AccountView::reloginAccount(const Account &account)
-{
-    bool accepted;
-    do {
-#ifdef HAVE_SHIBBOLETH_SUPPORT
-        if (account.isShibboleth) {
-            ShibLoginDialog shib_dialog(account.serverUrl, seafApplet->settingsManager()->getComputerName(), this);
-            accepted = shib_dialog.exec() == QDialog::Accepted;
-            break;
-        }
-#endif
-        LoginDialog dialog(this);
-        dialog.initFromAccount(account);
-        accepted = dialog.exec() == QDialog::Accepted;
-    } while (0);
-
-    if (accepted) {
-        getRepoTokenWhenRelogin(account);
-    }
-}
-
-void AccountView::onLogoutDeviceRequestSuccess()
-{
-    LogoutDeviceRequest *req = (LogoutDeviceRequest *)QObject::sender();
-    const Account& account = req->account();
-    QString error;
-    if (seafApplet->rpcClient()->removeSyncTokensByAccount(account.serverUrl.host(),
-                                                           account.username,
-                                                           &error)  < 0) {
-        seafApplet->warningBox(
-            tr("Failed to remove local repos sync token: %1").arg(error),
-            this);
-        return;
-    }
-    seafApplet->accountManager()->clearAccountToken(account);
-
-    req->deleteLater();
-}
-
-void AccountView::onLogoutDeviceRequestFailed(const ApiError& error)
-{
-    LogoutDeviceRequest *req = (LogoutDeviceRequest *)QObject::sender();
-    req->deleteLater();
-    QString msg;
-    if (error.httpErrorCode() == 404) {
-        msg = tr("Logging out is not supported on your server (version too low).");
-    } else {
-        msg = tr("Failed to remove information on server: %1").arg(error.toString());
-    }
-    seafApplet->warningBox(msg, this);
-}
-
-void AccountView::onGetRepoTokensSuccess()
-{
-    GetRepoTokensRequest *req = (GetRepoTokensRequest *)(sender());
-    foreach (const QString& repo_id, req->repoTokens().keys()) {
-        seafApplet->rpcClient()->setRepoToken(
-            repo_id, req->repoTokens().value(repo_id));
-    }
-    req->deleteLater();
-}
-
-void AccountView::onGetRepoTokensFailed(const ApiError& error)
-{
-    GetRepoTokensRequest *req = (GetRepoTokensRequest *)QObject::sender();
-    req->deleteLater();
-    seafApplet->warningBox(
-        tr("Failed to get repo sync information from server: %1").arg(error.toString()), this);
+    seafApplet->accountManager()->logoutDevice(account);
 }
 
 void AccountView::visitServerInBrowser(const QString& link)

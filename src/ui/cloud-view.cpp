@@ -1,8 +1,3 @@
-extern "C" {
-
-#include <ccnet/peer.h>
-}
-
 #include <QtGlobal>
 #include <vector>
 
@@ -38,11 +33,13 @@ namespace
 const int kRefreshStatusInterval = 1000;
 
 const int kIndexOfAccountView = 1;
-const int kIndexOfToolBar = 2;
-const int kIndexOfTabWidget = 3;
+// const int kIndexOfToolBar = 2;
+const int kIndexOfTabWidget = 2;
 const char* kQuotaColorCritical = "#FF2A2A";
 const char* kQuotaColorWarning = "#FF9A2A";
 const char* kQuotaColorGood = "#92C87A";
+const char* kDrapInnerBorderColor = "#E4E4E4";
+const char* kDrapEnterBorderColor = "#ED6C00";
 
 enum {
     TAB_INDEX_REPOS = 0,
@@ -83,7 +80,7 @@ CloudView::CloudView(QWidget* parent)
 {
     setupUi(this);
 
-    int marginTop = 10;
+    int marginTop = 0;
     if (shouldUseFramelessWindow()) {
         marginTop = 0;
     }
@@ -102,7 +99,7 @@ CloudView::CloudView(QWidget* parent)
 
     // tool bar have to be created after tabs, since some of the toolbar
     // actions are provided by the tabs
-    createToolBar();
+    // createToolBar();
 
     setupDropArea();
 
@@ -110,7 +107,6 @@ CloudView::CloudView(QWidget* parent)
 
     QVBoxLayout* vlayout = (QVBoxLayout*)layout();
     vlayout->insertWidget(kIndexOfAccountView, account_view_);
-    vlayout->insertWidget(kIndexOfToolBar, tool_bar_);
     vlayout->insertWidget(kIndexOfTabWidget, tabs_);
 
     if (shouldUseFramelessWindow()) {
@@ -164,11 +160,13 @@ void CloudView::setupHeader()
 void CloudView::createAccountView()
 {
     account_view_ = new AccountView;
-#ifdef Q_OS_MAC
-    account_view_->setContentsMargins(0, 0, 0, -8);
-#else
-    account_view_->setContentsMargins(0, -8, 0, -8);
-#endif
+// #ifdef Q_OS_MAC
+//     account_view_->setContentsMargins(0, 0, 0, -8);
+// #else
+//     account_view_->setContentsMargins(0, -8, 0, -8);
+// #endif
+    connect(account_view_, SIGNAL(refresh()),
+            this, SLOT(onRefreshClicked()));
 }
 
 void CloudView::createTabs()
@@ -180,13 +178,14 @@ void CloudView::createTabs()
 
     QString base_icon_path = ":/images/tabs/";
     QString highlighted_base_icon_path = ":/images/tabs/highlighted/";
-    tabs_->addTab(repos_tab_, tr("Libraries"), base_icon_path + "files.png",
-                  highlighted_base_icon_path + "files.png");
+    tabs_->addTab(repos_tab_, tr("Libraries"),
+                  base_icon_path + "library-normal.png",
+                  highlighted_base_icon_path + "library-orange.png");
 
     starred_files_tab_ = new StarredFilesTab;
     tabs_->addTab(starred_files_tab_, tr("Starred"),
-                  base_icon_path + "starred.png",
-                  highlighted_base_icon_path + "starred.png");
+                  base_icon_path + "star-normal.png",
+                  highlighted_base_icon_path + "star-orange.png");
 
     activities_tab_ = new ActivitiesTab;
 
@@ -219,24 +218,28 @@ void CloudView::setupFooter()
     // connect(mDownloadTasksBtn, SIGNAL(clicked()), this,
     // SLOT(showCloneTasksDialog()));
 
-    mServerStatusBtn->setIcon(QIcon(":/images/main-panel/connected.png"));
-    mServerStatusBtn->setIconSize(QSize(18, 18));
+    mServerStatusBtn->setIconSize(QSize(10, 10));
     connect(mServerStatusBtn, SIGNAL(clicked()), this,
             SLOT(showServerStatusDialog()));
 
     // mDownloadRateArrow->setText(QChar(icon_arrow_down));
     // mDownloadRateArrow->setFont(awesome->font(16));
-    mDownloadRateArrow->setPixmap(QPixmap(":/images/main-panel/down.png"));
+    mDownloadRateArrow->setPixmap(QIcon(":/images/main-panel/download.png").pixmap(10));
+    mDownloadRateArrow->setAlignment(Qt::AlignVCenter);
     mDownloadRate->setText("0 kB/s");
     mDownloadRate->setToolTip(tr("current download rate"));
+    mDownloadRate->setAlignment(Qt::AlignVCenter | Qt::AlignRight);
 
     // mUploadRateArrow->setText(QChar(icon_arrow_up));
     // mUploadRateArrow->setFont(awesome->font(16));
-    mUploadRateArrow->setPixmap(QPixmap(":/images/main-panel/up.png"));
+    mUploadRateArrow->setPixmap(QIcon(":/images/main-panel/upload.png").pixmap(10));
+    mUploadRateArrow->setAlignment(Qt::AlignVCenter);
     mUploadRate->setText("0 kB/s");
     mUploadRate->setToolTip(tr("current upload rate"));
+    mUploadRate->setAlignment(Qt::AlignVCenter | Qt::AlignRight);
 
     mStorageUsage->reset();
+    mStorageUsage->setAlignment(Qt::AlignVCenter);
 }
 
 void CloudView::chooseFolderToSync()
@@ -317,6 +320,10 @@ bool CloudView::eventFilter(QObject* obj, QEvent* event)
                     path = utils::mac::fix_file_id_url(path);
 #endif
                     if (QFileInfo(path).isDir()) {
+                        QString style =
+                            QString("QFrame#mDropInner {border: 1.5px dashed %1;}")
+                                .arg(kDrapEnterBorderColor);
+                        mDropInner->setStyleSheet(style);
                         ev->acceptProposedAction();
                     }
                 }
@@ -332,7 +339,20 @@ bool CloudView::eventFilter(QObject* obj, QEvent* event)
 #endif
             ev->setDropAction(Qt::CopyAction);
             ev->accept();
+            QString style =
+                QString("QFrame#mDropInner {border: 1.5px dashed %1;}")
+                    .arg(kDrapInnerBorderColor);
+            mDropInner->setStyleSheet(style);
             showCreateRepoDialog(path);
+            return true;
+        }
+        else if (event->type() == QEvent::DragLeave) {
+            QDragLeaveEvent* ev = static_cast<QDragLeaveEvent*>(event);
+            dragLeaveEvent(ev);
+            QString style =
+                QString("QFrame#mDropInner {border: 1.5px dashed %1;}")
+                    .arg(kDrapInnerBorderColor);
+            mDropInner->setStyleSheet(style);
             return true;
         }
     }
@@ -391,10 +411,15 @@ void CloudView::refreshServerStatus()
     else {
         tool_tip = tr("some servers not connected");
     }
-    mServerStatusBtn->setIcon(
-        QIcon(service->allServersConnected()
-                  ? ":/images/main-panel/connected.png"
-                  : ":/images/main-panel/unconnected.png"));
+
+    if (!service->allServersConnected()) {
+        mServerStatusBtn->setIcon(
+            QIcon(":/images/main-panel/network-error.png"));
+        mServerStatusBtn->show();
+    } else {
+        mServerStatusBtn->hide();
+    }
+
     mServerStatusBtn->setToolTip(tool_tip);
 }
 
@@ -441,34 +466,6 @@ void CloudView::showServerStatusDialog()
     dialog.exec();
 }
 
-void CloudView::createToolBar()
-{
-    tool_bar_ = new QToolBar;
-    tool_bar_->setIconSize(QSize(24, 24));
-
-    std::vector<QAction*> repo_actions = repos_tab_->getToolBarActions();
-    for (size_t i = 0, n = repo_actions.size(); i < n; i++) {
-        QAction* action = repo_actions[i];
-        tool_bar_->addAction(action);
-    }
-
-    QWidget* spacer = new QWidget;
-    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    tool_bar_->addWidget(spacer);
-
-    refresh_action_ = new QAction(tr("Refresh"), this);
-    refresh_action_->setIcon(QIcon(":/images/toolbar/refresh.png"));
-    refresh_action_->setEnabled(hasAccount());
-    connect(refresh_action_, SIGNAL(triggered()), this,
-            SLOT(onRefreshClicked()));
-    tool_bar_->addAction(refresh_action_);
-
-    QWidget* spacer_right = new QWidget;
-    spacer_right->setObjectName("spacerWidget");
-    spacer_right->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
-    tool_bar_->addWidget(spacer_right);
-}
-
 void CloudView::onRefreshClicked()
 {
     if (tabs_->currentIndex() == TAB_INDEX_REPOS) {
@@ -483,6 +480,8 @@ void CloudView::onRefreshClicked()
     else if (tabs_->currentIndex() == TAB_INDEX_SEARCH) {
         search_tab_->refresh();
     }
+
+    ServerStatusService::instance()->refresh();
 }
 
 void CloudView::resizeEvent(QResizeEvent* event)
@@ -540,13 +539,15 @@ void CloudView::onAccountChanged()
         }
     }
 
-    refresh_action_->setEnabled(account.isValid());
+    // refresh_action_->setEnabled(account.isValid());
 
     showProperTabs();
 
     repos_tab_->refresh();
     starred_files_tab_->refresh();
-    activities_tab_->refresh();
+    if (seafApplet->accountManager()->currentAccount().isPro()) {
+        activities_tab_->refresh();
+    }
     search_tab_->reset();
 
     account_view_->onAccountChanged();
@@ -609,12 +610,13 @@ void CloudView::showProperTabs()
         }
         if (show_activities_tab) {
             tabs_->addTab(activities_tab_, tr("Activities"),
-                          ":/images/tabs/history.png",
-                          ":/images/tabs/highlighted/history.png");
+                          ":/images/tabs/history-normal.png",
+                          ":/images/tabs/highlighted/history-orange.png");
         }
         if (show_search_tab) {
-            tabs_->addTab(search_tab_, tr("Search"), ":/images/tabs/search.png",
-                          ":/images/tabs/highlighted/search.png");
+            tabs_->addTab(search_tab_, tr("Search"),
+                          ":/images/tabs/search-normal.png",
+                          ":/images/tabs/highlighted/search-orange.png");
         }
     }
     tabs_->adjustTabsWidth(rect().width());

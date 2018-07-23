@@ -30,7 +30,12 @@ public:
     int saveAccount(const Account& account);
     int removeAccount(const Account& account);
 
+    void logoutDevice(const Account& account);
+    void logoutDeviceNonautoLogin();
+
     bool clearAccountToken(const Account& account);
+    bool clearSyncToken(const Account& account);
+    void removeNonautoLoginSyncTokens();
 
     const std::vector<Account>& loadAccounts();
     bool accountExists(const QUrl& url, const QString& username);
@@ -58,28 +63,41 @@ public:
 
     void updateAccountInfo(const Account& account, const AccountInfo& info);
 
+    bool validateAndUseAccount(const Account& account);
+
     // accessors
     const std::vector<Account>& accounts() const { return accounts_; }
 
     // invalidate current login and emit a re-login signal
     void invalidateCurrentLogin();
 
+    void getSyncedReposToken(const Account& account);
+
 signals:
     /**
      * Account added/removed/switched.
      */
-    void beforeAccountChanged();
+    void beforeAccountSwitched();
     void accountsChanged();
+    void accountAboutToRelogin(const Account& account);
     void accountRequireRelogin(const Account& account);
 
     void requireAddAccount();
     void accountInfoUpdated(const Account& account);
+
+public slots:
+    bool reloginAccount(const Account &account);
 
 private slots:
     void serverInfoSuccess(const Account &account, const ServerInfo &info);
     void serverInfoFailed(const ApiError&);
 
     void onAccountsChanged();
+
+    void onAboutToQuit();
+
+    void onGetRepoTokensSuccess();
+    void onGetRepoTokensFailed(const ApiError& error);
 
 private:
     Q_DISABLE_COPY(AccountManager)

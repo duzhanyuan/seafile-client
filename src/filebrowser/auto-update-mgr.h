@@ -5,10 +5,12 @@
 #include <QHash>
 #include <QQueue>
 #include <QRunnable>
+#include <QScopedPointer>
 
 #include "utils/singleton.h"
 #include "account.h"
 #include "data-cache.h"
+#include "data-mgr.h"
 
 class AutoUpdateManager : public QObject {
     SINGLETON_DEFINE(AutoUpdateManager)
@@ -20,7 +22,25 @@ public:
     void watchCachedFile(const Account& account,
                          const QString& repo_id,
                          const QString& path);
+
+    enum FileStatus {
+        // Local cache is consistent with the version on the server
+        SYNCED = 0,
+        // The file is being auto-uploaded
+        UPLOADING,
+        // Not synced and also not uploading, this happens e.g. when the upload
+        // request failed
+        NOT_SYNCED,
+    };
+
+    QHash<QString, FileStatus> getFileStatusForDirectory(
+        const QString &account_sig,
+        const QString &repo_id,
+        const QString &path,
+        const QList<SeafDirent>& dirents);
     void cleanCachedFile();
+    void uploadFile(const QString& local_path);
+    void dumpCacheStatus();
 
 signals:
     void fileUpdated(const QString& repo_id, const QString& path);
@@ -29,6 +49,7 @@ private slots:
     void onFileChanged(const QString& path);
     void onUpdateTaskFinished(bool success);
     void checkFileRecreated();
+    void systemShutDown();
 
 private:
     AutoUpdateManager();
@@ -39,21 +60,30 @@ private:
         Account account;
         QString repo_id;
         QString path_in_repo;
+        qint64 mtime;
+        qint64 fsize;
+
         bool uploading;
 
-        WatchedFileInfo() : uploading(false) {}
+        WatchedFileInfo() {}
         WatchedFileInfo(const Account& account,
                         const QString& repo_id,
-                        const QString& path_in_repo)
+                        const QString& path_in_repo,
+                        qint64 mtime,
+                        qint64 fsize)
             : account(account),
               repo_id(repo_id),
               path_in_repo(path_in_repo),
-              uploading(false) {}
+              mtime(mtime),
+              fsize(fsize)
+              {}
     };
 
     QHash<QString, WatchedFileInfo> watch_infos_;
 
     QQueue<WatchedFileInfo> deleted_files_infos_;
+
+    bool system_shut_down_;
 };
 
 #ifdef Q_OS_MAC

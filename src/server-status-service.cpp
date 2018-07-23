@@ -45,7 +45,7 @@ void ServerStatusService::refresh(bool only_refresh_unconnected)
     for (size_t i = 0; i < accounts.size(); i++) {
         const QUrl& url = accounts[i].serverUrl;
         if (requests_.contains(url.host())) {
-            return;
+            continue;
         }
 
         if (!statuses_.contains(url.host())) {
@@ -53,7 +53,7 @@ void ServerStatusService::refresh(bool only_refresh_unconnected)
         }
 
         if (only_refresh_unconnected && isServerConnected(url)) {
-            return;
+            continue;
         }
         pingServer(url);
     }
@@ -113,4 +113,43 @@ bool ServerStatusService::allServersDisconnected() const
 bool ServerStatusService::isServerConnected(const QUrl& url) const
 {
     return statuses_.value(url.host()).connected;
+}
+
+void ServerStatusService::updateOnSuccessfullRequest(const QUrl& url)
+{
+    updateOnRequestFinished(url, true);
+}
+
+void ServerStatusService::updateOnFailedRequest(const QUrl& url)
+{
+    updateOnRequestFinished(url, false);
+}
+
+void ServerStatusService::updateOnRequestFinished(const QUrl& url, bool no_network_error)
+{
+    bool found = false;
+    const std::vector<Account>& accounts = seafApplet->accountManager()->accounts();
+    for (size_t i = 0; i < accounts.size(); i++) {
+        if (url.host() == accounts[i].serverUrl.host()) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        qWarning("ServerStatusService: ignore request for host \"%s\"", url.host().toUtf8().data());
+        return;
+    }
+
+    bool changed = false;
+    if (statuses_.contains(url.host())) {
+        const ServerStatus& status = statuses_[url.host()];
+        if (status.connected != no_network_error) {
+            changed = true;
+        }
+    }
+    statuses_[url.host()] = ServerStatus(url, no_network_error);
+
+    if (changed) {
+        emit serverStatusChanged();
+    }
 }

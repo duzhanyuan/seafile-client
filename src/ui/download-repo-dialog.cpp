@@ -91,6 +91,7 @@ DownloadRepoDialog::DownloadRepoDialog(const Account& account,
         setWindowTitle(tr("Sync folder \"%1\"").arg(repo.parent_path));
     }
     mDirectory->setPlaceholderText(getOperatingText(repo_));
+    mDirectory->setReadOnly(true);
     setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
     setWindowIcon(QIcon(":/images/seafile.png"));
 
@@ -244,7 +245,7 @@ void DownloadRepoDialog::onOkBtnClicked()
     req->send();
 }
 
-bool DownloadRepoDialog::validateInputsManualMergeMode()
+bool DownloadRepoDialog::validateInputDirectory()
 {
     QDir dir(mDirectory->text());
     if (!dir.exists()) {
@@ -275,8 +276,12 @@ bool DownloadRepoDialog::validateInputs()
         }
     }
 
+    if (!validateInputDirectory()) {
+        return false;
+    }
+
     if (manual_merge_mode_) {
-        return validateInputsManualMergeMode();
+        return true;
     }
 
     sync_with_existing_ = false;
@@ -316,6 +321,7 @@ bool DownloadRepoDialog::validateInputs()
             alternative_path_ = new_path;
         }
     }
+
     return true;
 }
 
@@ -365,6 +371,8 @@ void DownloadRepoDialog::onDownloadRepoRequestSuccess(const RepoDownloadInfo& in
             error = QObject::tr("The path \"%1\" conflicts with system path").arg(worktree);
         } else if (error == "Worktree conflicts existing repo") {
             error = QObject::tr("The path \"%1\" conflicts with an existing library").arg(worktree);
+        } else if (error == "Library name contains invalid characters such as ':', '*', '|', '?'") {
+            error = QObject::tr("Library name contains invalid characters such as ':', '*', '|', '?'");
         }
         seafApplet->warningBox(tr("Failed to add download task:\n %1").arg(error), this);
         setAllInputsEnabled(true);

@@ -22,7 +22,8 @@ public:
     const QString& path() const { return path_; }
 
 signals:
-    void success(bool current_readonly, const QList<SeafDirent> &dirents);
+    void success(bool current_readonly, const QList<SeafDirent> &dirents, const QString& repo_id);
+    void failed(const ApiError& error, const QString& repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -66,7 +67,7 @@ public:
     const QString &path() { return path_; }
 
 signals:
-    void success();
+    void success(const QString& repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -91,7 +92,7 @@ public:
     const QString& newName() const { return new_name_; }
 
 signals:
-    void success();
+    void success(const QString& repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -116,7 +117,7 @@ public:
     const QString& path() const { return path_; }
 
 signals:
-    void success();
+    void success(const QString& repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -129,6 +130,32 @@ private:
     const QString path_;
 };
 
+class RemoveDirentsRequest : public SeafileApiRequest {
+    Q_OBJECT
+public:
+    RemoveDirentsRequest(const Account &account,
+                         const QString &repo_id,
+                         const QString &parent_path,
+                         const QStringList& filenames);
+
+    const QString& repoId() const { return repo_id_; }
+    const QString& parentPath() const { return parent_path_; }
+    const QStringList& filenames() const { return filenames_; }
+
+signals:
+    void success(const QString& repo_id);
+
+protected slots:
+    void requestSuccess(QNetworkReply& reply);
+
+private:
+    Q_DISABLE_COPY(RemoveDirentsRequest)
+
+    const QString repo_id_;
+    const QString parent_path_;
+    const QStringList filenames_;
+};
+
 
 class GetSharedLinkRequest : public SeafileApiRequest {
     Q_OBJECT
@@ -137,13 +164,14 @@ public:
                              const QString &path, bool is_file);
 
 signals:
-    void success(const QString& url);
+    void success(const QString& url, const QString& repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
 
 private:
     Q_DISABLE_COPY(GetSharedLinkRequest)
+    const QString repo_id_;
 };
 
 class GetFileUploadLinkRequest : public SeafileApiRequest {
@@ -198,7 +226,7 @@ public:
     const QStringList& srcFileNames() { return src_file_names_; }
 
 signals:
-    void success();
+    void success(const QString& dst_repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -208,6 +236,7 @@ private:
     const QString repo_id_;
     const QString src_dir_path_;
     const QStringList src_file_names_;
+    const QString dst_repo_id_;
 };
 
 class MoveMultipleFilesRequest : public SeafileApiRequest {
@@ -224,7 +253,7 @@ public:
     const QStringList& srcFileNames() { return src_file_names_; }
 
 signals:
-    void success();
+    void success(const QString& dst_repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -234,6 +263,7 @@ private:
     const QString repo_id_;
     const QString src_dir_path_;
     const QStringList src_file_names_;
+    const QString dst_repo_id_;
 };
 
 class StarFileRequest : public SeafileApiRequest {
@@ -281,7 +311,7 @@ public:
     const QString & path() const { return path_; }
 
 signals:
-    void success();
+    void success(const QString& repo_id);
 
 protected slots:
     void requestSuccess(QNetworkReply& reply);
@@ -291,6 +321,51 @@ private:
     const bool lock_;
     const QString repo_id_;
     const QString path_;
+};
+
+class GetFileUploadedBytesRequest : public SeafileApiRequest {
+    Q_OBJECT
+public:
+    GetFileUploadedBytesRequest(const Account& account,
+                                const QString& repo_id,
+                                const QString& parent_dir,
+                                const QString& file_name);
+
+    const QString & repoId() const { return repo_id_; }
+    const QString & parentDir() const { return parent_dir_; }
+    const QString & fileName() const { return file_name_; }
+
+signals:
+    void success(bool support_chunked_uploading, quint64 uploaded_bytes);
+
+protected slots:
+    void requestSuccess(QNetworkReply& reply);
+
+private:
+    Q_DISABLE_COPY(GetFileUploadedBytesRequest);
+    const QString repo_id_;
+    const QString parent_dir_;
+    const QString file_name_;
+};
+
+struct ServerIndexProgress {
+    qint64 total;
+    qint64 indexed;
+    qint64 status;
+};
+
+class GetIndexProgressRequest : public SeafileApiRequest {
+    Q_OBJECT
+public:
+    GetIndexProgressRequest(const QUrl &url, const QString &task_id);
+signals:
+    void success(const ServerIndexProgress& result);
+
+protected slots:
+    void requestSuccess(QNetworkReply& reply);
+
+private:
+    Q_DISABLE_COPY(GetIndexProgressRequest);
 };
 
 #endif  // SEAFILE_CLIENT_FILE_BROWSER_REQUESTS_H

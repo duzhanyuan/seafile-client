@@ -20,6 +20,8 @@ class GetRepoRequest;
 class CreateSubrepoRequest;
 class DirentsCache;
 class FileCache;
+class FileCache;
+class FileNetworkTask;
 class FileUploadTask;
 class FileDownloadTask;
 
@@ -29,10 +31,16 @@ class FileDownloadTask;
  *
  */
 class DataManager : public QObject {
+    SINGLETON_DEFINE(DataManager)
     Q_OBJECT
+
 public:
-    DataManager(const Account& account);
+    DataManager();
     ~DataManager();
+
+    void start();
+
+    const Account& account() const { return account_; }
 
     bool getDirents(const QString& repo_id,
                     const QString& path,
@@ -57,6 +65,10 @@ public:
     void removeDirent(const QString &repo_id,
                       const QString &path,
                       bool is_file);
+
+    void removeDirents(const QString &repo_id,
+                       const QString &parent_path,
+                       const QStringList &filenames);
 
     void shareDirent(const QString &repo_id,
                      const QString &path,
@@ -113,55 +125,62 @@ public:
     void createSubrepo(const QString &name, const QString& repo_id, const QString &path);
 
 signals:
-    void getDirentsSuccess(bool current_readonly, const QList<SeafDirent>& dirents);
-    void getDirentsFailed(const ApiError& error);
+    void aboutToDestroy();
 
-    void createDirectorySuccess(const QString& path);
+    void getDirentsSuccess(bool current_readonly, const QList<SeafDirent>& dirents, const QString& repo_id);
+    void getDirentsFailed(const ApiError& error, const QString& repo_id);
+
+    void createDirectorySuccess(const QString& path, const QString& repo_id);
     void createDirectoryFailed(const ApiError& error);
 
-    void lockFileSuccess(const QString& path, bool lock);
+    void lockFileSuccess(const QString& path, bool lock, const QString& repo_id);
     void lockFileFailed(const ApiError& error);
 
-    void renameDirentSuccess(const QString& path, const QString& new_name);
+    void renameDirentSuccess(const QString& path, const QString& new_name, const QString& repo_id);
     void renameDirentFailed(const ApiError& error);
 
-    void removeDirentSuccess(const QString& path);
+    void removeDirentSuccess(const QString& path, const QString& repo_id);
     void removeDirentFailed(const ApiError& error);
 
-    void shareDirentSuccess(const QString& link);
+    void removeDirentsSuccess(const QString& parent_path, const QStringList& filenames, const QString& repo_id);
+    void removeDirentsFailed(const ApiError& error);
+
+    void shareDirentSuccess(const QString& link, const QString& repo_id);
     void shareDirentFailed(const ApiError& error);
 
-    void copyDirentsSuccess();
+    void copyDirentsSuccess(const QString& dst_repo_id);
     void copyDirentsFailed(const ApiError& error);
 
-    void moveDirentsSuccess();
+    void moveDirentsSuccess(const QString& dst_repo_id);
     void moveDirentsFailed(const ApiError& error);
 
-    void createSubrepoSuccess(const ServerRepo &repo);
+    void createSubrepoSuccess(const ServerRepo &repo, const QString& repo_id);
     void createSubrepoFailed(const ApiError& error);
 
 private slots:
-    void onGetDirentsSuccess(bool current_readonly, const QList<SeafDirent>& dirents);
+    void onGetDirentsSuccess(bool current_readonly, const QList<SeafDirent>& dirents, const QString& repo_id);
     void onFileUploadFinished(bool success);
     void onFileDownloadFinished(bool success);
 
-    void onCreateDirectorySuccess();
-    void onLockFileSuccess();
-    void onRenameDirentSuccess();
-    void onRemoveDirentSuccess();
-    void onCopyDirentsSuccess();
-    void onMoveDirentsSuccess();
+    void onCreateDirectorySuccess(const QString& repo_id);
+    void onLockFileSuccess(const QString& repo_id);
+    void onRenameDirentSuccess(const QString& repo_id);
+    void onRemoveDirentSuccess(const QString& repo_id);
+    void onRemoveDirentsSuccess(const QString& repo_id);
+    void onCopyDirentsSuccess(const QString& dst_repo_id);
+    void onMoveDirentsSuccess(const QString& dst_repo_id);
 
     void onCreateSubrepoSuccess(const QString& new_repoid);
     void onCreateSubrepoRefreshSuccess(const ServerRepo& new_repo);
+
+    void onAccountChanged();
 
 private:
     void removeDirentsCache(const QString& repo_id,
                             const QString& path,
                             bool is_file);
-    const Account account_;
-
-    QScopedPointer<GetDirentsRequest, QScopedPointerDeleteLater> get_dirents_req_;
+    void setupTaskCleanup(FileNetworkTask *task);
+    Account account_;
 
     QScopedPointer<CreateSubrepoRequest, QScopedPointerDeleteLater> create_subrepo_req_;
     QString create_subrepo_parent_repo_id_;
@@ -173,6 +192,7 @@ private:
     FileCache *filecache_;
 
     DirentsCache *dirents_cache_;
+    QString old_repo_id_;
 
     static QHash<QString, std::pair<qint64, QString> > passwords_cache_;
 };

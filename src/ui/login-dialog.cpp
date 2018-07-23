@@ -6,7 +6,6 @@
 #include <QtGui>
 #endif
 #include <QtNetwork>
-#include <QInputDialog>
 #include <QStringList>
 #include <QSettings>
 
@@ -29,7 +28,9 @@ const char *const kPreconfigureServerAddr = "PreconfigureServerAddr";
 const char *const kPreconfigureServerAddrOnly = "PreconfigureServerAddrOnly";
 const char *const kPreconfigureShibbolethLoginUrl = "PreconfigureShibbolethLoginUrl";
 
-const char *const kSeafileOTPHeader = "X-Seafile-OTP";
+const char *const kSeafileOTPHeader = "X-SEAFILE-OTP";
+const char *const kRememberDeviceHeader = "X-SEAFILE-2FA-TRUST-DEVICE";
+const char *const kTwofactorHeader = "X-SEAFILE-S2FA";
 
 QStringList getUsedServerAddresses()
 {
@@ -70,6 +71,7 @@ LoginDialog::LoginDialog(QWidget *parent) : QDialog(parent)
 
     request_ = NULL;
     account_info_req_ = NULL;
+    is_remember_device_ = false;
 
     mStatusText->setText("");
     mLogo->setPixmap(QPixmap(":/images/seafile-32.png"));
@@ -85,8 +87,9 @@ LoginDialog::LoginDialog(QWidget *parent) : QDialog(parent)
     }
     mServerAddr->setAutoCompletion(false);
 
-    QString computerName = seafApplet->settingsManager()->getComputerName();
+    mAutomaticLogin->setCheckState(Qt::Checked);
 
+    QString computerName = seafApplet->settingsManager()->getComputerName();
     mComputerName->setText(computerName);
 
     connect(mSubmitBtn, SIGNAL(clicked()), this, SLOT(doLogin()));
@@ -104,7 +107,7 @@ LoginDialog::LoginDialog(QWidget *parent) : QDialog(parent)
 #ifdef HAVE_SHIBBOLETH_SUPPORT
 void LoginDialog::setupShibLoginLink()
 {
-    QString txt = QString("<a style=\"color:#777\" href=\"#\">%1</a>").arg(tr("Shibboleth Login"));
+    QString txt = QString("<a style=\"color:#777\" href=\"#\">%1</a>").arg(tr("Single Sign On"));
     mShibLoginLink->setText(txt);
     connect(mShibLoginLink, SIGNAL(linkActivated(const QString&)),
             this, SLOT(loginWithShib()));
@@ -140,12 +143,22 @@ void LoginDialog::doLogin()
     }
 
     request_ = new LoginRequest(url_, username_, password_, computer_name_);
+
     if (!two_factor_auth_token_.isEmpty()) {
         request_->setHeader(kSeafileOTPHeader, two_factor_auth_token_);
     }
 
-    connect(request_, SIGNAL(success(const QString&)),
-            this, SLOT(loginSuccess(const QString&)));
+    if (is_remember_device_) {
+        request_->setHeader(kRememberDeviceHeader, "1");
+    }
+
+    Account account =  seafApplet->accountManager()->getAccountByHostAndUsername(url_.host(), username_);
+    if (account.hasS2FAToken()) {
+        request_->setHeader(kTwofactorHeader, account.s2fa_token);
+    }
+
+    connect(request_, SIGNAL(success(const QString&, const QString&)),
+            this, SLOT(loginSuccess(const QString&, const QString&)));
 
     connect(request_, SIGNAL(failed(const ApiError&)),
             this, SLOT(loginFailed(const ApiError&)));
@@ -241,13 +254,13 @@ bool LoginDialog::validateInputs()
     return true;
 }
 
-void LoginDialog::loginSuccess(const QString& token)
+void LoginDialog::loginSuccess(const QString& token, const QString& s2fa_token)
 {
     if (account_info_req_) {
         account_info_req_->deleteLater();
     }
     account_info_req_ =
-        new FetchAccountInfoRequest(Account(url_, username_, token));
+        new FetchAccountInfoRequest(Account(url_, username_, token, 0, false, true, s2fa_token));
     connect(account_info_req_, SIGNAL(success(const AccountInfo&)), this,
             SLOT(onFetchAccountInfoSuccess(const AccountInfo&)));
     connect(account_info_req_, SIGNAL(failed(const ApiError&)), this,
@@ -283,6 +296,8 @@ void LoginDialog::onFetchAccountInfoSuccess(const AccountInfo& info)
     // The user may use the username to login, but we need to store the email
     // to account database
     account.username = info.email;
+    account.isAutomaticLogin =
+        mAutomaticLogin->checkState() == Qt::Checked;
     if (seafApplet->accountManager()->saveAccount(account) < 0) {
         showWarning(tr("Failed to save current account"));
     }
@@ -297,12 +312,12 @@ void LoginDialog::onHttpError(int code)
     const QNetworkReply* reply = request_->reply();
     if (reply->hasRawHeader(kSeafileOTPHeader) &&
         QString(reply->rawHeader(kSeafileOTPHeader)) == "required") {
-        two_factor_auth_token_ = QInputDialog::getText(
-            this,
-            tr("Two Factor Authentication"),
-            tr("Enter the two factor authentication token"),
-            QLineEdit::Normal,
-            "");
+        TwoFactorDialog two_factor_dialog;
+        if (two_factor_dialog.exec() == QDialog::Accepted) {
+            two_factor_auth_token_ = two_factor_dialog.getText();
+            is_remember_device_ = two_factor_dialog.rememberDeviceChecked();
+        }
+
         if (!two_factor_auth_token_.isEmpty()) {
             doLogin();
             return;
@@ -337,52 +352,77 @@ void LoginDialog::showWarning(const QString& msg)
 }
 
 #ifdef HAVE_SHIBBOLETH_SUPPORT
+
+bool LoginDialog::getShibLoginUrl(const QString& last_shib_url, QUrl *url_out)
+{
+    QString server_addr = last_shib_url;
+    QUrl url;
+
+    while (true) {
+        bool ok;
+        server_addr =
+            seafApplet->getText(this,
+                                tr("Single Sign On"),
+                                tr("%1 Server Address").arg(getBrand()),
+                                QLineEdit::Normal,
+                                server_addr,
+                                &ok);
+        server_addr = server_addr.trimmed();
+
+        // exit when user hits cancel button
+        if (!ok) {
+            return false;
+        }
+
+        if (server_addr.isEmpty()) {
+            showWarning(tr("Server address must not be empty").arg(server_addr));
+            continue;
+        }
+
+        if (!server_addr.startsWith("https://")) {
+            showWarning(tr("%1 is not a valid server address. It has to start with 'https://'").arg(server_addr));
+            continue;
+        }
+
+        url = QUrl(server_addr, QUrl::StrictMode);
+        if (!url.isValid()) {
+            showWarning(tr("%1 is not a valid server address").arg(server_addr));
+            continue;
+        }
+
+        *url_out = url;
+        return true;
+    }
+}
+
 void LoginDialog::loginWithShib()
 {
-    QString serverAddr =
+    QString server_addr =
         seafApplet->readPreconfigureEntry(kPreconfigureShibbolethLoginUrl)
             .toString()
             .trimmed();
-    if (!serverAddr.isEmpty()) {
-        if (QUrl(serverAddr).isValid()) {
+    if (!server_addr.isEmpty()) {
+        if (QUrl(server_addr).isValid()) {
             qWarning("Using preconfigured shibboleth login url: %s\n",
-                     toCStr(serverAddr));
+                     toCStr(server_addr));
         } else {
             qWarning("Invalid preconfigured shibboleth login url: %s\n",
-                     toCStr(serverAddr));
-            serverAddr = "";
+                     toCStr(server_addr));
+            server_addr = "";
         }
     }
 
-    if (serverAddr.isEmpty()) {
+    QUrl url = server_addr;
+    if (server_addr.isEmpty()) {
         // When we reach here, there is no preconfigured shibboleth login url,
         // or the preconfigured url is invalid. So we ask the user for the url.
-        QString lastUsedShibUrl = seafApplet->settingsManager()->getLastShibUrl();
-        serverAddr =
-            QInputDialog::getText(this,
-                                  tr("Shibboleth Login"),
-                                  tr("%1 Server Address").arg(getBrand()),
-                                  QLineEdit::Normal,
-                                  lastUsedShibUrl);
-        serverAddr = serverAddr.trimmed();
+        server_addr = seafApplet->settingsManager()->getLastShibUrl();
+        if (!getShibLoginUrl(server_addr, &url)) {
+            return;
+        }
     }
 
-    if (serverAddr.isEmpty()) {
-        return;
-    }
-
-    if (!serverAddr.startsWith("http://") && !serverAddr.startsWith("https://")) {
-        showWarning(tr("%1 is not a valid server address").arg(serverAddr));
-        return;
-    }
-
-    QUrl url = QUrl(serverAddr, QUrl::StrictMode);
-    if (!url.isValid()) {
-        showWarning(tr("%1 is not a valid server address").arg(serverAddr));
-        return;
-    }
-
-    seafApplet->settingsManager()->setLastShibUrl(serverAddr);
+    seafApplet->settingsManager()->setLastShibUrl(url.toString());
 
     ShibLoginDialog shib_dialog(url, mComputerName->text(), this);
     if (shib_dialog.exec() == QDialog::Accepted) {

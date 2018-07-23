@@ -7,6 +7,7 @@
 #include "account.h"
 #include "api/api-error.h"
 #include "seaf-dirent.h"
+#include "utils/utils.h"
 
 namespace {
 
@@ -18,6 +19,8 @@ const char kGetFileUpdateUrl[] = "api2/repos/%1/update-link/";
 const char kGetStarredFilesUrl[] = "api2/starredfiles/";
 const char kFileOperationCopy[] = "api2/repos/%1/fileops/copy/";
 const char kFileOperationMove[] = "api2/repos/%1/fileops/move/";
+const char kRemoveDirentsURL[] = "api2/repos/%1/fileops/delete/";
+const char kGetFileUploadedBytesUrl[] = "api/v2.1/repos/%1/file-uploaded-bytes/";
 //const char kGetFileFromRevisionUrl[] = "api2/repos/%1/file/revision/";
 //const char kGetFileDetailUrl[] = "api2/repos/%1/file/detail/";
 //const char kGetFileHistoryUrl[] = "api2/repos/%1/file/history/";
@@ -40,7 +43,7 @@ void GetDirentsRequest::requestSuccess(QNetworkReply& reply)
     json_error_t error;
     QString dir_id = reply.rawHeader("oid");
     if (dir_id.length() != 40) {
-        emit failed(ApiError::fromHttpError(500));
+        emit failed(ApiError::fromHttpError(500), repo_id_);
         return;
     }
     // this extra header column only supported from v4.2 seahub
@@ -49,7 +52,7 @@ void GetDirentsRequest::requestSuccess(QNetworkReply& reply)
     json_t *root = parseJSON(reply, &error);
     if (!root) {
         qDebug("GetDirentsRequest: failed to parse json:%s\n", error.text);
-        emit failed(ApiError::fromJsonError());
+        emit failed(ApiError::fromJsonError(), repo_id_);
         return;
     }
 
@@ -57,7 +60,7 @@ void GetDirentsRequest::requestSuccess(QNetworkReply& reply)
 
     QList<SeafDirent> dirents;
     dirents = SeafDirent::listFromJSON(json.data(), &error);
-    emit success(readonly_, dirents);
+    emit success(readonly_, dirents, repo_id_);
 }
 
 GetFileDownloadLinkRequest::GetFileDownloadLinkRequest(const Account &account,
@@ -101,7 +104,7 @@ GetSharedLinkRequest::GetSharedLinkRequest(const Account &account,
                                            bool is_file)
     : SeafileApiRequest(
           account.getAbsoluteUrl(QString(kGetFileSharedLinkUrl).arg(repo_id)),
-          SeafileApiRequest::METHOD_PUT, account.token)
+          SeafileApiRequest::METHOD_PUT, account.token), repo_id_(repo_id)
 {
     setFormParam("type", is_file ? "f" : "d");
     setFormParam("p", path);
@@ -111,7 +114,7 @@ void GetSharedLinkRequest::requestSuccess(QNetworkReply& reply)
 {
     QString reply_content(reply.rawHeader("Location"));
 
-    emit success(reply_content);
+    emit success(reply_content, repo_id_);
 }
 
 CreateDirectoryRequest::CreateDirectoryRequest(const Account &account,
@@ -131,7 +134,7 @@ CreateDirectoryRequest::CreateDirectoryRequest(const Account &account,
 
 void CreateDirectoryRequest::requestSuccess(QNetworkReply& reply)
 {
-    emit success();
+    emit success(repo_id_);
 }
 
 GetFileUploadLinkRequest::GetFileUploadLinkRequest(const Account &account,
@@ -185,7 +188,7 @@ RenameDirentRequest::RenameDirentRequest(const Account &account,
 
 void RenameDirentRequest::requestSuccess(QNetworkReply& reply)
 {
-    emit success();
+    emit success(repo_id_);
 }
 
 RemoveDirentRequest::RemoveDirentRequest(const Account &account,
@@ -203,7 +206,26 @@ RemoveDirentRequest::RemoveDirentRequest(const Account &account,
 
 void RemoveDirentRequest::requestSuccess(QNetworkReply& reply)
 {
-    emit success();
+    emit success(repo_id_);
+}
+
+RemoveDirentsRequest::RemoveDirentsRequest(const Account &account,
+                                           const QString &repo_id,
+                                           const QString &parent_path,
+                                           const QStringList& filenames)
+    : SeafileApiRequest(
+        account.getAbsoluteUrl(
+            QString(kRemoveDirentsURL).arg(repo_id)),
+        SeafileApiRequest::METHOD_POST, account.token),
+      repo_id_(repo_id), parent_path_(parent_path), filenames_(filenames)
+{
+    setUrlParam("p", parent_path_);
+    setFormParam("file_names", filenames_.join(":"));
+}
+
+void RemoveDirentsRequest::requestSuccess(QNetworkReply& reply)
+{
+    emit success(repo_id_);
 }
 
 MoveFileRequest::MoveFileRequest(const Account &account,
@@ -238,7 +260,8 @@ CopyMultipleFilesRequest::CopyMultipleFilesRequest(const Account &account,
     SeafileApiRequest::METHOD_POST, account.token),
     repo_id_(repo_id),
     src_dir_path_(src_dir_path),
-    src_file_names_(src_file_names)
+    src_file_names_(src_file_names),
+    dst_repo_id_(dst_repo_id)
 {
     setUrlParam("p", src_dir_path);
 
@@ -249,7 +272,7 @@ CopyMultipleFilesRequest::CopyMultipleFilesRequest(const Account &account,
 
 void CopyMultipleFilesRequest::requestSuccess(QNetworkReply& reply)
 {
-    emit success();
+    emit success(dst_repo_id_);
 }
 
 MoveMultipleFilesRequest::MoveMultipleFilesRequest(const Account &account,
@@ -263,7 +286,8 @@ MoveMultipleFilesRequest::MoveMultipleFilesRequest(const Account &account,
     SeafileApiRequest::METHOD_POST, account.token),
     repo_id_(repo_id),
     src_dir_path_(src_dir_path),
-    src_file_names_(src_file_names)
+    src_file_names_(src_file_names),
+    dst_repo_id_(dst_repo_id)
 {
     setUrlParam("p", src_dir_path);
 
@@ -274,7 +298,7 @@ MoveMultipleFilesRequest::MoveMultipleFilesRequest(const Account &account,
 
 void MoveMultipleFilesRequest::requestSuccess(QNetworkReply& reply)
 {
-    emit success();
+    emit success(dst_repo_id_);
 }
 
 StarFileRequest::StarFileRequest(const Account &account,
@@ -323,5 +347,77 @@ LockFileRequest::LockFileRequest(const Account &account, const QString &repo_id,
 
 void LockFileRequest::requestSuccess(QNetworkReply& reply)
 {
-    emit success();
+    emit success(repo_id_);
+}
+
+GetFileUploadedBytesRequest::GetFileUploadedBytesRequest(
+    const Account &account,
+    const QString &repo_id,
+    const QString &parent_dir,
+    const QString &file_name)
+    : SeafileApiRequest(
+          account.getAbsoluteUrl(QString(kGetFileUploadedBytesUrl).arg(repo_id)),
+          SeafileApiRequest::METHOD_GET,
+          account.token),
+      repo_id_(repo_id),
+      parent_dir_(parent_dir),
+      file_name_(file_name)
+{
+    setUrlParam("parent_dir",
+                parent_dir.startsWith("/") ? parent_dir : "/" + parent_dir);
+    setUrlParam("file_name", file_name);
+}
+
+void GetFileUploadedBytesRequest::requestSuccess(QNetworkReply &reply)
+{
+    QString accept_ranges_header = reply.rawHeader("Accept-Ranges");
+    // printf ("accept_ranges_header = %s\n", toCStr(accept_ranges_header));
+    if (accept_ranges_header != "bytes") {
+        // Chunked uploading is not supported on the server
+        emit success(false, 0);
+        return;
+    }
+
+    json_error_t error;
+    json_t* root = parseJSON(reply, &error);
+    if (!root) {
+        qWarning("GetFileUploadedBytesRequest: failed to parse json:%s\n",
+                 error.text);
+        emit failed(ApiError::fromJsonError());
+        return;
+    }
+
+    QScopedPointer<json_t, JsonPointerCustomDeleter> json(root);
+
+    QMap<QString, QVariant> dict = mapFromJSON(json.data(), &error);
+    quint64 uploaded_bytes = dict["uploadedBytes"].toLongLong();
+    // printf ("uploadedBytes = %lld\n", uploaded_bytes);
+    emit success(true, uploaded_bytes);
+}
+
+GetIndexProgressRequest::GetIndexProgressRequest(const QUrl &url, const QString &task_id)
+    : SeafileApiRequest(url, SeafileApiRequest::METHOD_GET)
+{
+    setUrlParam("task_id", task_id);
+}
+
+void GetIndexProgressRequest::requestSuccess(QNetworkReply& reply)
+{
+    json_error_t error;
+    json_t *root = parseJSON(reply, &error);
+    if (!root) {
+        qWarning("GetIndexProgressRequest: failed to parse json:%s\n", error.text);
+        emit failed(ApiError::fromJsonError());
+        return;
+    }
+
+    QScopedPointer<json_t, JsonPointerCustomDeleter> json(root);
+
+    QMap<QString, QVariant> dict = mapFromJSON(json.data(), &error);
+    ServerIndexProgress result;
+
+    result.total = dict.value("total").toInt();
+    result.indexed = dict.value("indexed").toInt();
+    result.status = dict.value("status").toInt();
+    emit success(result);
 }

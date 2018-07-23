@@ -9,6 +9,8 @@
 #include <QStackedLayout>
 #include <QVBoxLayout>
 
+#include "utils/paint-utils.h"
+
 #include "seafile-tab-widget.h"
 
 namespace {
@@ -17,13 +19,17 @@ const int kTabIconSize = 24;
 
 const char *kTabsBackgroundColor = "white";
 const char *kSelectedTabBorderBottomColor = "#D58747";
+const char *kBorderColor = "#DCDCDE";
 const int kSelectedTabBorderBottomWidth = 3;
+const int kSelectedTabBorderBottomHeightAlpha = 2;
+const int kSelectedTabBorderBottomWidthAlpha = 20;
 
 } // namespace
 
 SeafileTabBar::SeafileTabBar(QWidget *parent)
     : QTabBar(parent)
 {
+    setMinimumSize(0, 48);
 }
 
 void SeafileTabBar::addTab(const QString& text,
@@ -43,7 +49,8 @@ void SeafileTabBar::paintEvent(QPaintEvent *event)
     painter.begin(this);
 
     for (int index = 0, total = count(); index < total; index++) {
-        const QRect rect = tabRect(index);
+        QRect rect = tabRect(index);
+        rect.adjust(0, 0, 0, 12);
 
         // QStyleOptionTabV3 tab;
         // initStyleOption(&tab, index);
@@ -54,32 +61,36 @@ void SeafileTabBar::paintEvent(QPaintEvent *event)
         // Draw the tab icon in the center
         QPoint top_left;
         top_left.setX(rect.topLeft().x() + ((rect.width() - kTabIconSize) / 2));
-        top_left.setY(rect.topLeft().y() + ((rect.height() - kTabIconSize) / 2));
+        top_left.setY(rect.topLeft().y() + ((rect.height() - kTabIconSize) / 2) + 2);
 
         QIcon icon(currentIndex() == index ? highlighted_icons_[index]
                                            : icons_[index]);
         QRect icon_rect(top_left, QSize(kTabIconSize, kTabIconSize));
-        // get the device pixel radio from current painter device
-        int scale_factor = 1;
-#if (QT_VERSION >= QT_VERSION_CHECK(5, 0, 0))
-        scale_factor = painter.device()->devicePixelRatio();
-#endif // QT5
-        QPixmap icon_pixmap(icon.pixmap(QSize(kTabIconSize, kTabIconSize) * scale_factor));
-#if (QT_VERSION >= QT_VERSION_CHECK(5, 0, 0))
-        icon_pixmap.setDevicePixelRatio(scale_factor);
-#endif // QT5
+        QPixmap icon_pixmap(icon.pixmap(QSize(kTabIconSize, kTabIconSize)));
         painter.drawPixmap(icon_rect, icon_pixmap);
 
-        int indicator_width = count() * rect.width() / 8;
+        // int indicator_width = count() * rect.width() / 8;
 
         // Draw the selected tab indicator
         if (currentIndex() == index) {
-            top_left.setX(rect.bottomLeft().x() + (rect.width() / 2) - (indicator_width / 2));
-            top_left.setY(rect.bottomLeft().y() - kSelectedTabBorderBottomWidth + 1);
-            QRect border_bottom_rect(top_left, QSize(indicator_width, kSelectedTabBorderBottomWidth));
+            // top_left.setX(rect.bottomLeft().x() + (rect.width() / 2) - (indicator_width / 2));
+            top_left.setX(rect.bottomLeft().x() + (rect.width() / 2) -
+                          (kSelectedTabBorderBottomWidthAlpha / 2));
+            // top_left.setY(rect.bottomLeft().y() - kSelectedTabBorderBottomHeightAlpha + 1);
+            top_left.setY(rect.topLeft().y() + ((rect.height() - kTabIconSize) / 2) +
+                          + 2 + kTabIconSize + 4);
+            QRect border_bottom_rect(top_left, QSize(kSelectedTabBorderBottomWidthAlpha,
+                                                     kSelectedTabBorderBottomHeightAlpha));
             painter.fillRect(border_bottom_rect, QColor(kSelectedTabBorderBottomColor));
         }
     }
+
+    // draw border
+    QPen borderPen(QColor(kBorderColor), 1);
+    painter.save();
+    painter.setPen(borderPen);
+    painter.drawLine(rect().topLeft(), rect().topRight());
+    painter.restore();
 }
 
 

@@ -25,13 +25,19 @@ public:
     bool is_locked;
     bool locked_by_me;
     QString lock_owner;
+    QString lock_owner_name;
     quint64 lock_time;
 
     bool isDir() const { return type == DIR; }
     bool isFile() const { return type == FILE; }
 
+    const QString& getLockOwnerDisplayString() const;
+
     static SeafDirent fromJSON(const json_t*, json_error_t *error);
     static QList<SeafDirent> listFromJSON(const json_t*, json_error_t *error);
+
+    static SeafDirent dir(const QString& name);
+    static SeafDirent file(const QString& name, quint64 size);
 };
 
 

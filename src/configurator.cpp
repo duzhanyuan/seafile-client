@@ -12,7 +12,6 @@
 #include "utils/utils.h"
 #include "utils/file-utils.h"
 #include "seafile-applet.h"
-#include "ccnet-init.h"
 #include "ui/init-seafile-dialog.h"
 
 #if defined(Q_OS_WIN32)
@@ -70,18 +69,15 @@ bool Configurator::needInitConfig()
 
 void Configurator::initConfig()
 {
-    initCcnet();
-    initSeafile();
-}
-
-void Configurator::initCcnet()
-{
     QString path = QDir::toNativeSeparators(ccnet_dir_);
-    if (create_ccnet_config(path.toUtf8().data()) < 0) {
+    QDir ccnet_dir(ccnet_dir_);
+    if (!ccnet_dir.mkpath(".")) {
         seafApplet->errorAndExit(tr("Error when creating ccnet configuration"));
+        return;
     }
 
     first_use_ = true;
+    initSeafile();
 }
 
 void Configurator::initSeafile()
@@ -172,8 +168,8 @@ void Configurator::setSeafileDirAttributes()
 
 void Configurator::validateExistingConfig()
 {
-    QFile ccnet_conf(QDir(ccnet_dir_).filePath("ccnet.conf"));
-    if (!ccnet_conf.exists()) {
+    QFile seafile_ini(QDir(ccnet_dir_).filePath("seafile.ini"));
+    if (!seafile_ini.exists()) {
         initConfig();
         return;
     }
@@ -225,98 +221,6 @@ int Configurator::readSeafileIni(QString *content)
     *content = input.readLine();
 
     return 0;
-}
-
-int Configurator::setVirtualDrive(const QString& path, const QString& name)
-{
-    printf ("Configurator::setVirtualDrive is called\n");
-#if defined(Q_OS_WIN32)
-    QString clsid_path = QString("Software\\Classes\\CLSID\\{%1}").arg(kVirtualDriveGUID);
-
-    QList<RegElement> list;
-
-    /*
-      See http://msdn.microsoft.com/en-us/library/ms997573.aspx
-
-        HKEY_CLASSES_ROOT\CLSID\Classes\CLSID\{GUID}
-        - DefaultIcon = "c:/Program Files/Seafile/bin/seafile-appelet.exe", 0
-        - InProcServer32 = "%SystemRoot%\system32\shdocvw.dll"
-          - ThreadingModel = "Apartment"
-        - Instance
-          - CLSID = {0AFACED1-E828-11D1-9187-B532F1E9575D}
-          - InitPropertyBag
-            -Target(REG_SZ) = D:\Seafile
-        - ShellFolder
-          - Attributes=0xXXXXX
-          - PinToNameSpaceTree=""
-          - wantsFORPARSING=""
-    */
-
-    HKEY root = HKEY_CURRENT_USER;
-
-    list.append(RegElement(root, clsid_path, "", name));
-
-    list.append(RegElement(root, clsid_path,
-                           "InfoTip", tr("%1 Default Library").arg(getBrand())));
-
-    list.append(RegElement(root, clsid_path + "\\DefaultIcon",
-                           "", QCoreApplication::applicationFilePath(), true));
-
-    list.append(RegElement(root, clsid_path + "\\InProcServer32",
-                           "", "shdocvw.dll", true));
-
-    list.append(RegElement(root, clsid_path + "\\InProcServer32",
-                           "ThreadingModel", "Apartment"));
-
-    list.append(RegElement(root, clsid_path + "\\Instance",
-                           "CLSID", "{0AFACED1-E828-11D1-9187-B532F1E9575D}"));
-
-    list.append(RegElement(root, clsid_path + "\\Instance\\InitPropertyBag",
-                           "Target", QDir::toNativeSeparators(path)));
-
-    list.append(RegElement(root, clsid_path + "\\ShellFolder",
-                           "Attributes",
-                           SFGAO_FILESYSANCESTOR | SFGAO_FOLDER |
-                           SFGAO_FILESYSTEM | SFGAO_HASSUBFOLDER |
-                           SFGAO_BROWSABLE | SFGAO_STORAGEANCESTOR |
-                           SFGAO_STORAGE));
-
-    list.append(RegElement(root, clsid_path + "\\ShellFolder",
-                           "PinToNameSpaceTree", ""));
-
-    list.append(RegElement(root, clsid_path + "\\ShellFolder",
-                           "wantsFORPARSING", ""));
-
-    // HKEY_CURRENT_USESR\Software\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\Namespace
-    // - {GUID}
-
-    list.append(RegElement(root, kMyComputerNamespacePath + QString("\\{%1}").arg(kVirtualDriveGUID),
-                           "", ""));
-
-    for (int i = 0; i < list.size(); i++) {
-        RegElement& reg = list[i];
-        if (reg.add() < 0) {
-            return -1;
-        }
-    }
-#endif
-    return 0;
-}
-
-void Configurator::removeVirtualDrive()
-{
-#if defined(Q_OS_WIN32)
-    HKEY root = HKEY_CURRENT_USER;
-    QString parent, subkey;
-
-    parent = QString("Software\\Classes\\CLSID");
-    subkey = QString("{%1}").arg(kVirtualDriveGUID);
-    RegElement::removeRegKey(root, parent, subkey);
-
-    parent = kMyComputerNamespacePath;
-    subkey = QString("{%1}").arg(kVirtualDriveGUID);
-    RegElement::removeRegKey(root, parent, subkey);
-#endif
 }
 
 void Configurator::installCustomUrlHandler()

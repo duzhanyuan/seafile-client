@@ -14,7 +14,11 @@
 #include "api/api-error.h"
 #include "api/requests.h"
 #include "rpc/rpc-client.h"
+#include "rpc/local-repo.h"
 #include "account-info-service.h"
+#include "ui/login-dialog.h"
+#include "shib/shib-login-dialog.h"
+#include "settings-mgr.h"
 
 namespace {
 const char *kRepoRelayAddrProperty = "relay-address";
@@ -26,26 +30,37 @@ const char *kTotalStorage = "storage.total";
 const char *kUsedStorage = "storage.used";
 const char *kNickname = "name";
 
-bool getColumnInfoCallBack(sqlite3_stmt *stmt, void *data)
+struct ColumnCheckData {
+    QString name;
+    bool exists;
+};
+
+bool getColumnInfoCallback(sqlite3_stmt *stmt, void *data)
 {
-    bool *has_shibboleth_column = static_cast<bool*>(data);
+    ColumnCheckData *cdata = (ColumnCheckData *)data;
     const char *column_name = (const char *)sqlite3_column_text (stmt, 1);
 
-    if (0 == strcmp("isShibboleth", column_name))
-        *has_shibboleth_column = true;
+    if (cdata->name == QString(column_name)) {
+        cdata->exists = true;
+        return false;
+    }
 
     return true;
 }
 
-
-void updateAccountDatabaseForColumnShibbolethUrl(struct sqlite3* db)
+void addNewColumnToAccountsTable(struct sqlite3* db, const QString& name, const QString& type)
 {
-    bool has_shibboleth_column = false;
-    const char* sql = "PRAGMA table_info(Accounts);";
-    sqlite_foreach_selected_row (db, sql, getColumnInfoCallBack, &has_shibboleth_column);
-    sql = "ALTER TABLE Accounts ADD COLUMN isShibboleth INTEGER";
-    if (!has_shibboleth_column && sqlite_query_exec (db, sql) < 0)
-        qCritical("unable to create isShibboleth column\n");
+    QString sql = "PRAGMA table_info(Accounts);";
+    ColumnCheckData cdata;
+    cdata.name = name;
+    cdata.exists = false;
+    sqlite_foreach_selected_row (db, toCStr(sql), getColumnInfoCallback, &cdata);
+    if (!cdata.exists) {
+        sql = QString("ALTER TABLE Accounts ADD COLUMN %1 %2").arg(name).arg(type);
+        if (sqlite_query_exec (db, toCStr(sql)) < 0) {
+            qCritical("unable to create column %s\n", toCStr(name));
+        }
+    }
 }
 
 bool compareAccount(const Account& a, const Account& b)
@@ -76,6 +91,30 @@ inline void setServerInfoKeyValue(struct sqlite3 *db, const Account &account, co
         key.toUtf8().data(), value.toUtf8().data());
     sqlite_query_exec(db, zql);
     sqlite3_free(zql);
+}
+
+QStringList collectSyncedReposForAccount(const Account& account)
+{
+    std::vector<LocalRepo> repos;
+    SeafileRpcClient *rpc = seafApplet->rpcClient();
+    rpc->listLocalRepos(&repos);
+    QStringList repo_ids;
+    for (size_t i = 0; i < repos.size(); i++) {
+        LocalRepo repo = repos[i];
+        QString repo_server_url;
+        if (rpc->getRepoProperty(repo.id, "server-url", &repo_server_url) < 0) {
+            continue;
+        }
+        if (QUrl(repo_server_url).host() != account.serverUrl.host()) {
+            continue;
+        }
+        QString token;
+        if (rpc->getRepoProperty(repo.id, "token", &token) < 0 || token.isEmpty()) {
+            repo_ids.append(repo.id);
+        }
+    }
+
+    return repo_ids;
 }
 
 }
@@ -126,9 +165,12 @@ int AccountManager::start()
         return -1;
     }
 
-    updateAccountDatabaseForColumnShibbolethUrl(db);
+    addNewColumnToAccountsTable(db, "isShibboleth", "INTEGER");
+    addNewColumnToAccountsTable(db, "AutomaticLogin", "INTEGER default 1");
+    addNewColumnToAccountsTable(db, "s2fa_token", "TEXT");
 
-    // create ServerInfo table
+    // ServerInfo table is used to store any (key, value) information for an
+    // account.
     sql = "CREATE TABLE IF NOT EXISTS ServerInfo ("
         "key TEXT NOT NULL, value TEXT, "
         "url VARCHAR(24), username VARCHAR(15), "
@@ -145,7 +187,15 @@ int AccountManager::start()
     loadAccounts();
 
     connect(this, SIGNAL(accountsChanged()), this, SLOT(onAccountsChanged()));
+    connect(qApp, SIGNAL(aboutToQuit()), this, SLOT(onAboutToQuit()));
+    connect(this, SIGNAL(accountRequireRelogin(const Account&)),
+            this, SLOT(reloginAccount(const Account &)));
     return 0;
+}
+
+void AccountManager::onAboutToQuit()
+{
+    logoutDeviceNonautoLogin();
 }
 
 bool AccountManager::loadAccountsCB(sqlite3_stmt *stmt, void *data)
@@ -156,12 +206,20 @@ bool AccountManager::loadAccountsCB(sqlite3_stmt *stmt, void *data)
     const char *token = (const char *)sqlite3_column_text (stmt, 2);
     qint64 atime = (qint64)sqlite3_column_int64 (stmt, 3);
     int isShibboleth = sqlite3_column_int (stmt, 4);
+    int isAutomaticLogin = sqlite3_column_int (stmt, 5);
+    const char *s2fa_token = (const char *)sqlite3_column_text (stmt,6);
 
     if (!token) {
         token = "";
     }
 
-    Account account = Account(QUrl(QString(url)), QString(username), QString(token), atime, isShibboleth != 0);
+    if (!s2fa_token) {
+        s2fa_token = "";
+    }
+
+    Account account = Account(QUrl(QString(url)), QString(username),
+                              QString(token), atime, isShibboleth != 0,
+                              isAutomaticLogin != 0, QString(s2fa_token));
     char* zql = sqlite3_mprintf("SELECT key, value FROM ServerInfo WHERE url = %Q AND username = %Q", url, username);
     sqlite_foreach_selected_row (userdata->db, zql, loadServerInfoCB, &account);
     sqlite3_free(zql);
@@ -197,7 +255,8 @@ bool AccountManager::loadServerInfoCB(sqlite3_stmt *stmt, void *data)
 
 const std::vector<Account>& AccountManager::loadAccounts()
 {
-    const char *sql = "SELECT url, username, token, lastVisited, isShibboleth FROM Accounts ";
+    const char *sql = "SELECT url, username, token, lastVisited, isShibboleth, AutomaticLogin, s2fa_token "
+                      "FROM Accounts ORDER BY lastVisited DESC";
     accounts_.clear();
     UserData userdata;
     userdata.accounts = &accounts_;
@@ -211,11 +270,13 @@ const std::vector<Account>& AccountManager::loadAccounts()
 int AccountManager::saveAccount(const Account& account)
 {
     Account new_account = account;
+    bool account_exist = false;
     {
         QMutexLocker lock(&accounts_mutex_);
         for (size_t i = 0; i < accounts_.size(); i++) {
             if (accounts_[i] == account) {
                 accounts_.erase(accounts_.begin() + i);
+                account_exist = true;
                 break;
             }
         }
@@ -225,18 +286,44 @@ int AccountManager::saveAccount(const Account& account)
 
     qint64 timestamp = QDateTime::currentMSecsSinceEpoch();
 
-    char *zql = sqlite3_mprintf(
-        "REPLACE INTO Accounts(url, username, token, lastVisited, isShibboleth) VALUES (%Q, %Q, %Q, %Q, %Q) ",
-        // url
-        new_account.serverUrl.toEncoded().data(),
-        // username
-        new_account.username.toUtf8().data(),
-        // token
-        new_account.token.toUtf8().data(),
-        // lastVisited
-        QString::number(timestamp).toUtf8().data(),
-        // isShibboleth
-        QString::number(new_account.isShibboleth).toUtf8().data());
+    char *zql;
+    if (account_exist) {
+        zql = sqlite3_mprintf(
+            "UPDATE Accounts SET token = %Q, lastVisited = %Q, isShibboleth = %Q, AutomaticLogin = %Q, s2fa_token = %Q"
+            "WHERE url = %Q AND username = %Q",
+            // token
+            new_account.token.toUtf8().data(),
+            // lastVisited
+            QString::number(timestamp).toUtf8().data(),
+            // isShibboleth
+            QString::number(new_account.isShibboleth).toUtf8().data(),
+            // isAutomaticLogin
+            QString::number(new_account.isAutomaticLogin).toUtf8().data(),
+            //s2fa_token
+            new_account.s2fa_token.toUtf8().data(),
+            // url
+            new_account.serverUrl.toEncoded().data(),
+            // username
+            new_account.username.toUtf8().data());
+    } else {
+        zql = sqlite3_mprintf(
+            "INSERT INTO Accounts(url, username, token, lastVisited, isShibboleth, AutomaticLogin, s2fa_token) "
+            "VALUES (%Q, %Q, %Q, %Q, %Q, %Q, %Q) ",
+            // url
+            new_account.serverUrl.toEncoded().data(),
+            // username
+            new_account.username.toUtf8().data(),
+            // token
+            new_account.token.toUtf8().data(),
+            // lastVisited
+            QString::number(timestamp).toUtf8().data(),
+            // isShibboleth
+            QString::number(new_account.isShibboleth).toUtf8().data(),
+            // isAutomaticLogin
+            QString::number(new_account.isAutomaticLogin).toUtf8().data(),
+            //s2fa_token
+            new_account.s2fa_token.toUtf8().data());
+    }
     sqlite_query_exec(db, zql);
     sqlite3_free(zql);
 
@@ -256,13 +343,45 @@ int AccountManager::removeAccount(const Account& account)
     sqlite_query_exec(db, zql);
     sqlite3_free(zql);
 
-    QMutexLocker lock(&accounts_mutex_);
-    accounts_.erase(std::remove(accounts_.begin(), accounts_.end(), account),
-                    accounts_.end());
+    bool need_switch_account = currentAccount() == account;
+
+    {
+        QMutexLocker lock(&accounts_mutex_);
+        accounts_.erase(
+            std::remove(accounts_.begin(), accounts_.end(), account),
+            accounts_.end());
+    }
+
+    if (need_switch_account) {
+        if (!accounts_.empty()) {
+            validateAndUseAccount(accounts_[0]);
+        } else {
+            LoginDialog login_dialog;
+            login_dialog.exec();
+        }
+    }
 
     emit accountsChanged();
 
     return 0;
+}
+
+void AccountManager::logoutDevice(const Account& account)
+{
+    clearSyncToken(account);
+    clearAccountToken(account);
+}
+
+void AccountManager::logoutDeviceNonautoLogin()
+{
+    QMutexLocker lock(&accounts_mutex_);
+    for (const Account& account : accounts_) {
+        if (account.isAutomaticLogin) {
+            continue;
+        }
+        clearSyncToken(account);
+        clearAccountToken(account);
+    }
 }
 
 void AccountManager::updateAccountLastVisited(const Account& account)
@@ -291,13 +410,29 @@ bool AccountManager::accountExists(const QUrl& url, const QString& username)
     return false;
 }
 
+bool AccountManager::validateAndUseAccount(const Account& account)
+{
+    if (!account.isAutomaticLogin) {
+        clearAccountToken(account);
+        return reloginAccount(account);
+    }
+    else if (!account.isValid()) {
+        return reloginAccount(account);
+    }
+    else {
+        return setCurrentAccount(account);
+    }
+}
+
 bool AccountManager::setCurrentAccount(const Account& account)
 {
+    Q_ASSERT(account.isValid());
+
     if (account == currentAccount()) {
         return false;
     }
 
-    emit beforeAccountChanged();
+    emit beforeAccountSwitched();
 
     // Would emit "accountsChanged" signal
     saveAccount(account);
@@ -330,7 +465,8 @@ int AccountManager::replaceAccount(const Account& old_account, const Account& ne
         "    username = %Q, "
         "    token = %Q, "
         "    lastVisited = %Q, "
-        "    isShibboleth = %Q "
+        "    isShibboleth = %Q, "
+        "    AutomaticLogin = %Q "
         "WHERE url = %Q "
         "  AND username = %Q",
         // new_url
@@ -343,6 +479,8 @@ int AccountManager::replaceAccount(const Account& old_account, const Account& ne
         QString::number(timestamp).toUtf8().data(),
         // isShibboleth
         QString::number(new_account.isShibboleth).toUtf8().data(),
+        // isAutomaticLogin
+        QString::number(new_account.isAutomaticLogin).toUtf8().data(),
         // old_url
         old_account.serverUrl.toEncoded().data(),
         // username
@@ -419,27 +557,29 @@ void AccountManager::updateAccountInfo(const Account& account,
 }
 
 
-void AccountManager::serverInfoSuccess(const Account &account, const ServerInfo &info)
+void AccountManager::serverInfoSuccess(const Account &_account, const ServerInfo &info)
 {
+    Account account = _account;
+    account.serverInfo = info;
+
     setServerInfoKeyValue(db, account, kVersionKeyName, info.getVersionString());
     setServerInfoKeyValue(db, account, kFeaturesKeyName, info.getFeatureStrings().join(","));
     setServerInfoKeyValue(db, account, kCustomLogoKeyName, info.customLogo);
     setServerInfoKeyValue(db, account, kCustomBrandKeyName, info.customBrand);
+
+    bool changed = _account.serverInfo != info;
+    if (!changed)
+        return;
 
     QUrl url(account.serverUrl);
     url.setPath("/");
     seafApplet->rpcClient()->setServerProperty(
         url.toString(), "is_pro", account.isPro() ? "true" : "false");
 
-    bool changed = account.serverInfo != info;
-    if (!changed)
-        return;
-
-
     for (size_t i = 0; i < accounts_.size(); i++) {
         if (accounts_[i] == account) {
             if (i == 0)
-                emit beforeAccountChanged();
+                emit beforeAccountSwitched();
             accounts_[i].serverInfo = info;
             if (i == 0)
                 emit accountsChanged();
@@ -478,6 +618,33 @@ bool AccountManager::clearAccountToken(const Account& account)
     emit accountsChanged();
 
     return true;
+}
+
+bool AccountManager::clearSyncToken(const Account& account)
+{
+    QString error;
+    if (seafApplet->rpcClient()->removeSyncTokensByAccount(account.serverUrl.host(),
+                                                           account.username,
+                                                           &error)  < 0) {
+        seafApplet->warningBox(
+            tr("Failed to remove local repos sync token: %1").arg(error));
+        return false;
+    } else {
+        return true;
+    }
+}
+
+void AccountManager::removeNonautoLoginSyncTokens()
+{
+    QMutexLocker lock(&accounts_mutex_);
+    for (const Account& account : accounts_) {
+        if (account.isAutomaticLogin) {
+            continue;
+        }
+
+        clearSyncToken(account);
+    }
+    return;
 }
 
 Account AccountManager::getAccountByRepo(const QString& repo_id, SeafileRpcClient *rpc)
@@ -528,14 +695,96 @@ void AccountManager::invalidateCurrentLogin()
     if (account.token.isEmpty())
         return;
 
-    QString error;
-    if (seafApplet->rpcClient()->removeSyncTokensByAccount(account.serverUrl.host(),
-                                                           account.username,
-                                                           &error) < 0) {
-        qWarning("Failed to remove local repos sync token %s", error.toUtf8().data());
-    }
+    emit accountAboutToRelogin(account);
+
+    clearSyncToken(account);
     clearAccountToken(account);
     seafApplet->warningBox(tr("Authorization expired, please re-login"));
 
     emit accountRequireRelogin(account);
+}
+
+bool AccountManager::reloginAccount(const Account &account_in)
+{
+    qWarning("Relogin to account %s", account_in.username.toUtf8().data());
+    bool accepted;
+
+    // Make a copy of the account arugment because it may be released after the
+    // login succeeded.
+    //
+    // See: https://github.com/haiwen/seafile-client/blob/v6.1.3/src/account-mgr.cpp#L219
+    // See: https://gist.github.com/lins05/f952356ba8733d5aa19b54a6db19f69a
+    const Account account(account_in);
+
+    do {
+#ifdef HAVE_SHIBBOLETH_SUPPORT
+        if (account.isShibboleth) {
+            ShibLoginDialog shib_dialog(
+                account.serverUrl, seafApplet->settingsManager()->getComputerName());
+            accepted = shib_dialog.exec() == QDialog::Accepted;
+            break;
+        }
+#endif // HAVE_SHIBBOLETH_SUPPORT
+        LoginDialog dialog;
+        dialog.initFromAccount(account);
+        accepted = dialog.exec() == QDialog::Accepted;
+    } while (0);
+
+    if (accepted) {
+        getSyncedReposToken(account);
+    }
+
+    return accepted;
+}
+
+void AccountManager::getSyncedReposToken(const Account& account)
+{
+    QStringList repo_ids = collectSyncedReposForAccount(account);
+    if (repo_ids.empty()) {
+        return;
+    }
+
+    /* old account object don't contains the new token */
+    QString host = account.serverUrl.host();
+    QString username = account.username;
+    Account new_account = getAccountByHostAndUsername(host, username);
+    if (!new_account.isValid())
+        return;
+
+    // For debugging lots of repos problem.
+    // TODO: Comment this out before committing!!
+    //
+    // int targetNumberForDebug = 300;
+    // while (repo_ids.size() < targetNumberForDebug) {
+    //     repo_ids.append(repo_ids);
+    // }
+    // repo_ids = repo_ids.mid(0, 300);
+    // printf ("repo_ids.size() = %d\n", repo_ids.size());
+
+    GetRepoTokensRequest *req = new GetRepoTokensRequest(
+        new_account, repo_ids);
+
+    connect(req, SIGNAL(success()),
+            this, SLOT(onGetRepoTokensSuccess()));
+    connect(req, SIGNAL(failed(const ApiError&)),
+            this, SLOT(onGetRepoTokensFailed(const ApiError&)));
+    req->send();
+}
+
+void AccountManager::onGetRepoTokensSuccess()
+{
+    GetRepoTokensRequest *req = (GetRepoTokensRequest *)(sender());
+    foreach (const QString& repo_id, req->repoTokens().keys()) {
+        seafApplet->rpcClient()->setRepoToken(
+            repo_id, req->repoTokens().value(repo_id));
+    }
+    req->deleteLater();
+}
+
+void AccountManager::onGetRepoTokensFailed(const ApiError& error)
+{
+    GetRepoTokensRequest *req = (GetRepoTokensRequest *)QObject::sender();
+    req->deleteLater();
+    seafApplet->warningBox(
+        tr("Failed to get repo sync information from server: %1").arg(error.toString()));
 }

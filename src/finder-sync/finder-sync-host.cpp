@@ -12,6 +12,7 @@
 #include "auto-login-service.h"
 #include "settings-mgr.h"
 #include "seafile-applet.h"
+#include "daemon-mgr.h"
 #include "rpc/local-repo.h"
 #include "rpc/rpc-client.h"
 #include "filebrowser/file-browser-requests.h"
@@ -69,12 +70,23 @@ static std::unique_ptr<GetSharedLinkRequest, QtLaterDeleter> get_shared_link_req
 static std::unique_ptr<LockFileRequest, QtLaterDeleter> lock_file_req_;
 
 FinderSyncHost::FinderSyncHost() : rpc_client_(new SeafileRpcClient) {
-    rpc_client_->connectDaemon();
+    rpc_client_->tryConnectDaemon();
+    connect(seafApplet->daemonManager(), SIGNAL(daemonRestarted()), this, SLOT(onDaemonRestarted()));
 }
 
 FinderSyncHost::~FinderSyncHost() {
     get_shared_link_req_.reset();
     lock_file_req_.reset();
+}
+
+void FinderSyncHost::onDaemonRestarted()
+{
+    qDebug("reviving rpc client when daemon is restarted");
+    if (rpc_client_) {
+        delete rpc_client_;
+    }
+    rpc_client_ = new SeafileRpcClient();
+    rpc_client_->tryConnectDaemon();
 }
 
 utils::BufferArray FinderSyncHost::getWatchSet(size_t header_size,
@@ -176,7 +188,7 @@ void FinderSyncHost::doShareLink(const QString &path) {
         account, repo_id, QString("/").append(path_in_repo),
         QFileInfo(path).isFile()));
 
-    connect(get_shared_link_req_.get(), SIGNAL(success(const QString &)), this,
+    connect(get_shared_link_req_.get(), SIGNAL(success(const QString &, const QString&)), this,
             SLOT(onShareLinkGenerated(const QString &)));
 
     get_shared_link_req_->send();
@@ -244,6 +256,8 @@ bool FinderSyncHost::lookUpFileInformation(const QString &path, QString *repo_id
         return false;
 
     *path_in_repo = QDir(worktree).relativeFilePath(path);
+    if (!path_in_repo->startsWith("/"))
+        *path_in_repo = "/" + *path_in_repo;
     if (path.endsWith("/"))
         *path_in_repo += "/";
 

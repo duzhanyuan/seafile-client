@@ -20,7 +20,7 @@
 #include "account-mgr.h"
 #include "configurator.h"
 #include "daemon-mgr.h"
-#include "message-listener.h"
+#include "message-poller.h"
 #include "settings-mgr.h"
 #include "certs-mgr.h"
 #include "rpc/rpc-client.h"
@@ -34,7 +34,9 @@
 #include "filebrowser/thumbnail-service.h"
 #include "filebrowser/data-cache.h"
 #include "filebrowser/auto-update-mgr.h"
+#include "filebrowser/data-mgr.h"
 #include "rpc/local-repo.h"
+#include "rpc/rpc-server.h"
 #include "network-mgr.h"
 #include "server-status-service.h"
 #include "account-info-service.h"
@@ -191,13 +193,15 @@ SeafileApplet::SeafileApplet()
       daemon_mgr_(new DaemonManager),
       main_win_(NULL),
       rpc_client_(new SeafileRpcClient),
-      message_listener_(new MessageListener),
+      message_poller_(new MessagePoller),
       settings_dialog_(new SettingsDialog),
       settings_mgr_(new SettingsManager),
       certs_mgr_(new CertsManager),
+      data_mgr_(new DataManager),
       started_(false),
       in_exit_(false),
-      is_pro_(false)
+      is_pro_(false),
+      about_to_quit_(false)
 {
     tray_icon_ = new SeafileTrayIcon(this);
     connect(qApp, SIGNAL(aboutToQuit()), this, SLOT(onAboutToQuit()));
@@ -213,12 +217,13 @@ SeafileApplet::~SeafileApplet()
     delete tray_icon_;
     delete certs_mgr_;
     delete settings_dialog_;
-    delete message_listener_;
+    delete message_poller_;
     delete rpc_client_;
     delete daemon_mgr_;
 
     delete account_mgr_;
     delete configurator_;
+    delete data_mgr_;
     if (main_win_)
         delete main_win_;
 #if defined(Q_OS_WIN32)
@@ -239,9 +244,12 @@ void SeafileApplet::start()
 
     initLog();
 
+    qDebug("client id is %s", toCStr(getUniqueClientId()));
     account_mgr_->start();
 
     certs_mgr_->start();
+
+    data_mgr_->start();
 
 #if defined(Q_OS_WIN32)
     QString crash_rpt_path = QDir(configurator_->ccnetDir()).filePath("logs/seafile-crash-report.txt");
@@ -259,13 +267,17 @@ void SeafileApplet::start()
         account_mgr_->currentAccount().serverUrl,
         QDir(configurator_->seafileDir()).filePath("system-proxy.txt"));
 
+    FileCache::instance()->start();
+
     //
     // start daemons
     //
-    daemon_mgr_->startCcnetDaemon();
+    daemon_mgr_->startSeafileDaemon();
 
     connect(daemon_mgr_, SIGNAL(daemonStarted()),
             this, SLOT(onDaemonStarted()));
+    connect(daemon_mgr_, SIGNAL(daemonRestarted()),
+            this, SLOT(onDaemonRestarted()));
 }
 
 void SeafileApplet::onDaemonStarted()
@@ -274,7 +286,6 @@ void SeafileApplet::onDaemonStarted()
     // start daemon-related services
     //
     rpc_client_->connectDaemon();
-    message_listener_->connectDaemon();
 
     // Sleep 500 millseconds to wait seafile registering services
 
@@ -297,6 +308,7 @@ void SeafileApplet::onDaemonStarted()
     ServerStatusService::instance()->start();
     CustomizationService::instance()->start();
     AccountInfoService::instance()->start();
+    SeafileAppletRpcServer::instance()->start();
 
     account_mgr_->updateServerInfo();
 
@@ -320,8 +332,7 @@ void SeafileApplet::onDaemonStarted()
             if (!username.isEmpty() && !token.isEmpty() && !url.isEmpty()) {
                 Account account(url, username, token);
                 if (account_mgr_->saveAccount(account) < 0) {
-                    warningBox(tr("failed to add default account"));
-                    exit(1);
+                    errorAndExit(tr("failed to add default account"));
                 }
                 break;
             }
@@ -331,6 +342,10 @@ void SeafileApplet::onDaemonStarted()
             LoginDialog login_dialog;
             login_dialog.exec();
         } while (0);
+    } else if (!account_mgr_->accounts().empty()) {
+        const Account &account = account_mgr_->accounts()[0];
+        account_mgr_->removeNonautoLoginSyncTokens();
+        account_mgr_->validateAndUseAccount(account);
     }
 
     started_ = true;
@@ -341,6 +356,8 @@ void SeafileApplet::onDaemonStarted()
 
     tray_icon_->start();
     tray_icon_->setState(SeafileTrayIcon::STATE_DAEMON_UP);
+    message_poller_->start();
+
 
 #if defined(Q_OS_WIN32)
     QTimer::singleShot(kIntervalBeforeShowInitVirtualDialog, this, SLOT(checkInitVDrive()));
@@ -352,6 +369,14 @@ void SeafileApplet::onDaemonStarted()
         // We do this because clients before 6.0 don't set the "client_name" option.
         seafApplet->rpcClient()->seafileSetConfig(
         "client_name", settings_mgr_->getComputerName());
+    }
+
+    // Set the device id to the daemon so it can use it when generating commits.
+    // The "client_name" is not set here, but updated each time we call
+    // switch_account rpc.
+    if (rpc_client_->seafileGetConfig("client_id", &value) < 0 ||
+        value.isEmpty() || value != getUniqueClientId()) {
+        rpc_client_->seafileSetConfig("client_id", getUniqueClientId());
     }
 
     OpenLocalHelper::instance()->checkPendingOpenLocalRequest();
@@ -392,6 +417,7 @@ void SeafileApplet::checkInitVDrive()
 
 void SeafileApplet::onAboutToQuit()
 {
+    about_to_quit_ = true;
     tray_icon_->hide();
     if (main_win_) {
         main_win_->writeSettings();
@@ -499,7 +525,7 @@ void SeafileApplet::warningBox(const QString& msg, QWidget *parent)
     box.addButton(tr("OK"), QMessageBox::YesRole);
     box.exec();
 
-    if (!parent) {
+    if (!parent && main_win_) {
         main_win_->showWindow();
     }
     qWarning("%s", msg.toUtf8().data());
@@ -650,4 +676,110 @@ QString SeafileApplet::readPreconfigureExpandedString(const QString& key, const 
     if (retval.isNull() || retval.type() != QVariant::String)
         return QString();
     return expandVars(retval.toString());
+}
+
+
+QString SeafileApplet::getText(QWidget *parent,
+                               const QString &title,
+                               const QString &label,
+                               QLineEdit::EchoMode mode,
+                               const QString &text,
+                               bool *ok,
+                               Qt::WindowFlags flags,
+                               Qt::InputMethodHints inputMethodHints)
+{
+    QInputDialog tmp_dialog;
+    // Get rid of the help button
+    if (flags == 0) {
+        flags = tmp_dialog.windowFlags() & ~Qt::WindowContextHelpButtonHint;
+    }
+
+    return QInputDialog::getText(parent != nullptr ? parent : main_win_,
+                                 title,
+                                 label,
+                                 mode,
+                                 text,
+                                 ok,
+                                 flags,
+                                 inputMethodHints);
+}
+
+QString SeafileApplet::getUniqueClientId()
+{
+    static QString id;
+    if (!id.isEmpty()) {
+        return id;
+    }
+
+    // Id file path is `~/Seafile/.seafile-data/id`
+    QFile id_file(QDir(seafApplet->configurator()->seafileDir())
+                  .absoluteFilePath("id"));
+    if (!id_file.exists()) {
+        qWarning("id file not found, creating it");
+        // First migrate existing id from ccnet.conf General.ID
+        QString ccnet_conf_file = QDir(configurator_->ccnetDir()).absoluteFilePath("ccnet.conf");
+        QString ccnet_id;
+        if (QFile(ccnet_conf_file).exists()) {
+            QSettings ccnet_conf(ccnet_conf_file, QSettings::IniFormat);
+            ccnet_id = ccnet_conf.value("ID").toString();
+            if (ccnet_id.isEmpty()) {
+                ccnet_conf.beginGroup("General");
+                ccnet_id = ccnet_conf.value("ID", "").toString();
+            }
+        }
+
+        if (!ccnet_id.isEmpty()) {
+            id = ccnet_id;
+            qWarning("use existing ccnet id %s", toCStr(id));
+        } else {
+            srand(time(NULL));
+            while (id.length() < 40) {
+                int r = rand() % 0xff;
+                id += QString("%1").arg(r, 0, 16);
+            }
+            id = id.mid(0, 40);
+            qWarning("generated new device id %s", toCStr(id));
+        }
+
+        if (!id_file.open(QIODevice::WriteOnly)) {
+            errorAndExit(tr("failed to save client id"));
+            return "";
+        }
+
+        id_file.write(id.toUtf8().data());
+        return id;
+    }
+
+    if (!id_file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        errorAndExit(tr("failed to access %1").arg(id_file.fileName()));
+        return "";
+    }
+
+    QTextStream input(&id_file);
+    input.setCodec("UTF-8");
+
+    if (input.atEnd()) {
+        errorAndExit(tr("incorrect client id"));
+        return "";
+    }
+
+    id = input.readLine().trimmed();
+    if (id.length() != 40) {
+        errorAndExit(tr("failed to read %1").arg(id_file.fileName()));
+        return "";
+    }
+
+    qWarning("read id from id file");
+    return id;
+}
+
+void SeafileApplet::onDaemonRestarted()
+{
+    qDebug("reviving rpc client when daemon is restarted");
+    if (rpc_client_) {
+        delete rpc_client_;
+    }
+
+    rpc_client_ = new SeafileRpcClient();
+    rpc_client_->tryConnectDaemon();
 }

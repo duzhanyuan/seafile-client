@@ -2,8 +2,8 @@ CMAKE_MINIMUM_REQUIRED(VERSION 2.8.9)
 
 PROJECT(seafile-client)
 SET(SEAFILE_CLIENT_VERSION_MAJOR 6)
-SET(SEAFILE_CLIENT_VERSION_MINOR 0)
-SET(SEAFILE_CLIENT_VERSION_PATCH 6)
+SET(SEAFILE_CLIENT_VERSION_MINOR 2)
+SET(SEAFILE_CLIENT_VERSION_PATCH 2)
 SET(PROJECT_VERSION "${SEAFILE_CLIENT_VERSION_MAJOR}.${SEAFILE_CLIENT_VERSION_MINOR}.${SEAFILE_CLIENT_VERSION_PATCH}")
 ADD_DEFINITIONS(-DSEAFILE_CLIENT_VERSION=${PROJECT_VERSION})
 INCLUDE(FindPkgConfig)
@@ -206,6 +206,8 @@ if (APPLE)
     SET(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++")
 endif()
 
+ADD_DEFINITIONS(-DQUAZIP_STATIC)
+
 # MOC FILES
 SET(moc_headers
   src/seafile-applet.h
@@ -221,19 +223,22 @@ SET(moc_headers
   src/server-status-service.h
   src/account-info-service.h
   src/customization-service.h
-  src/message-listener.h
+  src/message-poller.h
   src/network-mgr.h
   src/settings-mgr.h
   src/traynotificationwidget.h
   src/traynotificationmanager.h
+  src/log-uploader.h
   src/api/api-client.h
   src/api/api-request.h
   src/api/requests.h
   src/rpc/rpc-client.h
+  src/rpc/rpc-server.h
   src/ui/main-window.h
   src/ui/init-seafile-dialog.h
   src/ui/login-dialog.h
   src/ui/account-settings-dialog.h
+  src/ui/check-repo-root-perm-dialog.h
   src/ui/create-repo-dialog.h
   src/ui/repo-detail-dialog.h
   src/ui/settings-dialog.h
@@ -254,6 +259,7 @@ SET(moc_headers
   src/ui/uninstall-helper-dialog.h
   src/ui/ssl-confirm-dialog.h
   src/ui/private-share-dialog.h
+  src/ui/user-name-completer.h
   src/ui/account-view.h
   src/ui/seafile-tab-widget.h
   src/ui/tab-view.h
@@ -270,12 +276,16 @@ SET(moc_headers
   src/ui/event-details-tree.h
   src/ui/set-repo-password-dialog.h
   src/ui/sync-errors-dialog.h
+  src/ui/search-bar.h
+  src/ui/two-factor-dialog.h
   src/filebrowser/file-browser-manager.h
   src/filebrowser/file-browser-dialog.h
   src/filebrowser/file-browser-requests.h
+  src/filebrowser/file-browser-search-tab.h
   src/filebrowser/file-table.h
   src/filebrowser/data-mgr.h
   src/filebrowser/tasks.h
+  src/filebrowser/reliable-upload.h
   src/filebrowser/progress-dialog.h
   src/filebrowser/sharedlink-dialog.h
   src/filebrowser/seafilelink-dialog.h
@@ -283,6 +293,7 @@ SET(moc_headers
   src/filebrowser/transfer-mgr.h
   src/filebrowser/thumbnail-service.h
   third_party/QtAwesome/QtAwesome.h
+  third_party/quazip/quazipfile.h
   ${platform_specific_moc_headers}
 )
 
@@ -312,6 +323,7 @@ SET(ui_files
   ui/ssl-confirm-dialog.ui
   ui/private-share-dialog.ui
   ui/account-view.ui
+  ui/two-factor-dialog.ui
   ui/set-repo-password-dialog.ui
   ${platform_specific_ui_files}
 )
@@ -356,8 +368,6 @@ PKG_CHECK_MODULES(SQLITE3 REQUIRED sqlite3>=3.0.0)
 
 PKG_CHECK_MODULES(JANSSON REQUIRED jansson>=2.0)
 
-PKG_CHECK_MODULES(LIBCCNET REQUIRED libccnet>=1.3)
-
 PKG_CHECK_MODULES(LIBSEARPC REQUIRED libsearpc>=1.0)
 
 PKG_CHECK_MODULES(OPENSSL REQUIRED openssl>=0.98)
@@ -365,6 +375,8 @@ PKG_CHECK_MODULES(OPENSSL REQUIRED openssl>=0.98)
 PKG_CHECK_MODULES(LIBSEAFILE REQUIRED libseafile>=1.7)
 
 PKG_CHECK_MODULES(LIBEVENT REQUIRED libevent>=2.0)
+
+PKG_CHECK_MODULES(ZLIB REQUIRED zlib>=1.2)
 ####################
 ###### END: other libraries configuration
 ####################
@@ -377,11 +389,10 @@ SET(seafile_client_sources
   src/seafile-applet.cpp
   src/account.cpp
   src/account-mgr.cpp
-  src/ccnet-init.cpp
   src/daemon-mgr.cpp
   src/configurator.cpp
   src/open-local-helper.cpp
-  src/message-listener.cpp
+  src/message-poller.cpp
   src/network-mgr.cpp
   src/auto-login-service.cpp
   src/repo-service.cpp
@@ -390,12 +401,12 @@ SET(seafile_client_sources
   src/server-status-service.cpp
   src/account-info-service.cpp
   src/customization-service.cpp
-  src/shared-application.cpp
   src/avatar-service.cpp
   src/settings-mgr.cpp
   src/traynotificationwidget.cpp
   src/traynotificationmanager.cpp
   src/certs-mgr.cpp
+  src/log-uploader.cpp
   src/api/api-client.cpp
   src/api/api-request.cpp
   src/api/api-error.cpp
@@ -406,6 +417,7 @@ SET(seafile_client_sources
   src/api/commit-details.cpp
   src/api/contact-share-info.cpp
   src/rpc/rpc-client.cpp
+  src/rpc/rpc-server.cpp
   src/rpc/local-repo.cpp
   src/rpc/clone-task.cpp
   src/rpc/sync-error.cpp
@@ -414,6 +426,7 @@ SET(seafile_client_sources
   src/ui/init-seafile-dialog.cpp
   src/ui/login-dialog.cpp
   src/ui/account-settings-dialog.cpp
+  src/ui/check-repo-root-perm-dialog.cpp
   src/ui/repo-detail-dialog.cpp
   src/ui/settings-dialog.cpp
   src/ui/create-repo-dialog.cpp
@@ -435,6 +448,7 @@ SET(seafile_client_sources
   src/ui/search-tab-items.cpp
   src/ui/ssl-confirm-dialog.cpp
   src/ui/private-share-dialog.cpp
+  src/ui/user-name-completer.cpp
   src/ui/proxy-style.cpp
   src/ui/account-view.cpp
   src/ui/seafile-tab-widget.cpp
@@ -453,13 +467,17 @@ SET(seafile_client_sources
   src/ui/event-details-tree.cpp
   src/ui/set-repo-password-dialog.cpp
   src/ui/sync-errors-dialog.cpp
+  src/ui/search-bar.cpp
+  src/ui/two-factor-dialog.cpp
   src/filebrowser/file-browser-manager.cpp
   src/filebrowser/file-browser-dialog.cpp
   src/filebrowser/file-browser-requests.cpp
+  src/filebrowser/file-browser-search-tab.cpp
   src/filebrowser/data-mgr.cpp
   src/filebrowser/data-cache.cpp
   src/filebrowser/file-table.cpp
   src/filebrowser/seaf-dirent.cpp
+  src/filebrowser/reliable-upload.cpp
   src/filebrowser/tasks.cpp
   src/filebrowser/progress-dialog.cpp
   src/filebrowser/sharedlink-dialog.cpp
@@ -480,6 +498,7 @@ INCLUDE_DIRECTORIES(
   ${CMAKE_CURRENT_BINARY_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/QtAwesome
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/quazip
   )
 
 FOREACH(USE_QT_LIBRARY ${USE_QT_LIBRARIES})
@@ -494,7 +513,6 @@ INCLUDE_DIRECTORIES(
   ${SQLITE3_INCLUDE_DIRS}
   ${JANSSON_INCLUDE_DIRS}
   ${LIBSEARPC_INCLUDE_DIRS}
-  ${LIBCCNET_INCLUDE_DIRS}
   ${LIBSEAFILE_INCLUDE_DIRS}
 )
 
@@ -502,11 +520,11 @@ LINK_DIRECTORIES(
   ${QT_LIBRARY_DIR}
   ${OPENSSL_LIBRARY_DIRS}
   ${LIBEVENT_LIBRARY_DIRS}
-  ${LIBCCNET_LIBRARY_DIRS}
   ${LIBSEAFILE_LIBRARY_DIRS}
   ${LIBSEARPC_LIBRARY_DIRS}
   ${SQLITE3_LIBRARRY_DIRS}
   ${JANSSON_LIBRARRY_DIRS}
+  ${ZLIB_LIBRARRY_DIRS}
 )
 
 ####################
@@ -540,7 +558,7 @@ FUNCTION(ADD_SC_LIBRARY name)
 
     TARGET_LINK_LIBRARIES(${name} ${QT_LIBRARIES}
         ${SQLITE3_LIBRARIES} ${JANSSON_LIBRARIES}
-        ${EXTRA_LIBS} -lglib-2.0 ${ARG_LINK_LIBS})
+        ${EXTRA_LIBS} -lglib-2.0 ${ARG_LINK_LIBS} ${ZLIB_LIBRARIES})
 ENDFUNCTION(ADD_SC_LIBRARY)
 
 # library utils
@@ -573,7 +591,27 @@ ENDIF()
 
 ADD_SC_LIBRARY(utils ${utils_sources})
 
-SET(SC_LIBS utils)
+# library quazip
+LIST(APPEND quazip_sources
+    third_party/quazip/JlCompress.cpp
+    third_party/quazip/quazip.cpp
+    third_party/quazip/quazipfile.cpp
+    third_party/quazip/quazipfileinfo.cpp
+    third_party/quazip/quaziodevice.cpp
+    third_party/quazip/quagzipfile.cpp
+    third_party/quazip/quazipnewinfo.cpp
+    third_party/quazip/quaadler32.cpp
+    third_party/quazip/quazipdir.cpp
+    third_party/quazip/quacrc32.cpp
+    third_party/quazip/qioapi.cpp
+    third_party/quazip/zip.c
+    third_party/quazip/unzip.c
+    )
+
+ADD_SC_LIBRARY(quazip ${quazip_sources})
+
+SET(SC_LIBS utils quazip)
+#SET(SC_LIBS utils)
 
 ####################
 ###### end: lib
@@ -628,6 +666,7 @@ FOREACH(LANGUAGE ${LANGUAGES})
     COMMAND ${QT_LUPDATE_EXECUTABLE} ${SEAFILE_TRANSLATE_SOURCES}
         -ts "${PROJECT_SOURCE_DIR}/i18n/seafile_${LANGUAGE}.ts"
         -I "${PROJECT_SOURCE_DIR}/src"
+        -locations none
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
   SET(SEAFILE_TS_TARGETS ${SEAFILE_TS_TARGETS} ${TS_TARGET})
@@ -750,22 +789,19 @@ TARGET_LINK_LIBRARIES(seafile-applet
   ${SQLITE3_LIBRARIES}
   ${JANSSON_LIBRARIES}
   ${LIBSEARPC_LIBRARIES}
-  ${LIBCCNET_LIBRARIES}
   ${LIBSEAFILE_LIBRARIES}
+  ${ZLIB_LIBRARIES}
   ${EXTRA_LIBS}
 )
 
-QT5_USE_MODULES(seafile-applet Core Gui Widgets Network)
+target_link_libraries(seafile-applet Qt5::Core Qt5::Gui Qt5::Widgets Qt5::Network)
 IF (BUILD_SHIBBOLETH_SUPPORT)
-QT5_USE_MODULES(seafile-applet ${WEBKIT_NAME} ${WEBKIT_WIDGETS_NAME})
+target_link_libraries(seafile-applet Qt5::${WEBKIT_NAME} Qt5::${WEBKIT_WIDGETS_NAME})
 ENDIF()
 
 ## QtBus
 IF (${CMAKE_SYSTEM_NAME} MATCHES "Linux" OR ${CMAKE_SYSTEM_NAME} MATCHES "BSD")
-  TARGET_LINK_LIBRARIES(seafile-applet
-    ${QT_QTDBUS_LIBRARIES}
-  )
-  QT5_USE_MODULES(seafile-applet ${USE_QT_LIBRARIES})
+  target_link_libraries(seafile-applet Qt5::DBus)
 ENDIF()
 
 ### Xcode-related, build as a osx bundle
@@ -775,14 +811,12 @@ IF(CMAKE_GENERATOR STREQUAL Xcode)
     MACOSX_BUNDLE true
     MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist
   )
-  FIND_PROGRAM(ccnet ccnet)
   FIND_PROGRAM(seaf-daemon seaf-daemon)
   SET(RESOURCES_DIR ${CMAKE_CURRENT_BINARY_DIR}/\${CONFIGURATION}/seafile-applet.app/Contents/Resources)
   ADD_CUSTOM_COMMAND(TARGET seafile-applet
       POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory ${RESOURCES_DIR}
       COMMAND ${CMAKE_COMMAND} -E copy seafile.icns ${RESOURCES_DIR}/.
-      COMMAND ${CMAKE_COMMAND} -E copy ${ccnet} ${RESOURCES_DIR}/.
       COMMAND ${CMAKE_COMMAND} -E copy ${seaf-daemon} ${RESOURCES_DIR}/.
   )
   SET(CMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS "YES")
@@ -808,7 +842,7 @@ IF (BUILD_TESTING)
 
         TARGET_LINK_LIBRARIES(${testname} ${QT_LIBRARIES}
                 ${QTESTLIB} ${SQLITE3_LIBRARIES} ${JANSSON_LIBRARIES}
-                ${EXTRA_LIBS} -lglib-2.0 ${SC_LIBS})
+                ${EXTRA_LIBS} -lglib-2.0 ${SC_LIBS} ${ZLIB_LIBRARIES})
         SET_TARGET_PROPERTIES(${testname} PROPERTIES
           RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests )
 

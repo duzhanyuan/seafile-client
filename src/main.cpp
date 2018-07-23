@@ -10,9 +10,9 @@
 #include "i18n.h"
 #include "crash-handler.h"
 #include "utils/utils.h"
+#include "utils/paint-utils.h"
 #include "utils/process.h"
 #include "utils/uninstall-helpers.h"
-#include "shared-application.h"
 #include "ui/proxy-style.h"
 #include "seafile-applet.h"
 #include "QtAwesome.h"
@@ -91,7 +91,7 @@ void setupSettingDomain()
 void handleCommandLineOption(int argc, char *argv[])
 {
     int c;
-    static const char *short_options = "KDXc:d:f:";
+    static const char *short_options = "KDXPc:d:f:";
     static const struct option long_options[] = {
         { "config-dir", required_argument, NULL, 'c' },
         { "data-dir", required_argument, NULL, 'd' },
@@ -100,6 +100,7 @@ void handleCommandLineOption(int argc, char *argv[])
         { "remove-user-data", no_argument, NULL, 'X' },
         { "open-local-file", no_argument, NULL, 'f' },
         { "stdout", no_argument, NULL, 'l' },
+        { "ping", no_argument, NULL, 'P' },
         { NULL, 0, NULL, 0, },
     };
 
@@ -117,6 +118,9 @@ void handleCommandLineOption(int argc, char *argv[])
             break;
         case 'K':
             do_stop();
+            exit(0);
+        case 'P':
+            do_ping();
             exit(0);
         case 'D':
             msleep(1000);
@@ -188,49 +192,34 @@ int main(int argc, char *argv[])
     // initialize style settings
     app.setStyle(new SeafileProxyStyle());
 
+    // start applet
+    SeafileApplet mApplet;
+    seafApplet = &mApplet;
+
     // handle with the command arguments
     handleCommandLineOption(argc, argv);
 
     // count if we have any instance running now. if more than one, exit
     if (count_process(APPNAME) > 1) {
-        // have we activated it ? exit
-        if (SharedApplication::activate())
+        if (OpenLocalHelper::instance()->activateRunningInstance()) {
+            printf("Activated running instance of seafile client\n");
             return 0;
-        if (QMessageBox::No == QMessageBox::warning(NULL, getBrand(),
-                QObject::tr("Found another running process of %1, kill it and start a new one?").arg(getBrand()),
-                QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes)) {
-            return -1;
         }
-
-        // sleep 9 * 100ms to await the os completing the operation
-        do_stop();
-        int n = 10;
-        while(--n >0 && count_process(APPNAME) > 1)
-            msleep(100);
-
-        // force shutdown it
-        if (count_process(APPNAME) > 1) {
-            shutdown_process(APPNAME);
-            msleep(100);
-        }
-
-        // count if we still have any instance running now. if more than one, exit
-        if (count_process(APPNAME) > 1) {
-            QMessageBox::critical(NULL, getBrand(),
-                QObject::tr("Unable to start %1 due to the failure of shutting down the previous process").arg(getBrand()),
-                QMessageBox::Ok);
-            return -1;
-        }
+        QMessageBox::warning(NULL, getBrand(),
+                             QObject::tr("%1 Client is already running").arg(getBrand()),
+                             QMessageBox::Ok);
+        return -1;
     }
 
     // init qtawesome component
     awesome = new QtAwesome(qApp);
     awesome->initFontAwesome();
 
-    // start applet
-    SeafileApplet mApplet;
-    seafApplet = &mApplet;
     seafApplet->start();
+
+    // qWarning("globalDevicePixelRatio() = %f\n", globalDevicePixelRatio());
+    // printf("globalDevicePixelRatio() = %f\n", globalDevicePixelRatio());
+    // fflush(stdout);
 
     // start qt eventloop
     ret = app.exec();

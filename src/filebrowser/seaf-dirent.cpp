@@ -1,8 +1,20 @@
 #include <jansson.h>
+#include <QDateTime>
 
 #include "utils/json-utils.h"
 
 #include "seaf-dirent.h"
+
+namespace {
+
+void initCommonFields(SeafDirent *dirent) {
+    dirent->mtime = QDateTime::currentDateTime().toTime_t();
+    dirent->readonly = false;
+    dirent->is_locked = false;
+    dirent->locked_by_me = false;
+}
+
+}
 
 SeafDirent SeafDirent::fromJSON(const json_t *root, json_error_t */* error */)
 {
@@ -24,6 +36,7 @@ SeafDirent SeafDirent::fromJSON(const json_t *root, json_error_t */* error */)
 
     dirent.is_locked = json.getBool("is_locked");
     dirent.lock_owner = json.getString("lock_owner");
+    dirent.lock_owner_name = json.getString("lock_owner_name");
     dirent.lock_time = json.getLong("lock_time");
     dirent.locked_by_me = json.getBool("locked_by_me");
 
@@ -39,4 +52,30 @@ QList<SeafDirent> SeafDirent::listFromJSON(const json_t *json, json_error_t *err
     }
 
     return dirents;
+}
+
+const QString& SeafDirent::getLockOwnerDisplayString() const
+{
+    return !lock_owner_name.isEmpty() ? lock_owner_name : lock_owner;
+}
+
+SeafDirent SeafDirent::dir(const QString& name)
+{
+    SeafDirent dirent;
+    dirent.type = DIR;
+    dirent.name = name;
+
+    initCommonFields(&dirent);
+    return dirent;
+}
+
+SeafDirent SeafDirent::file(const QString& name, quint64 size)
+{
+    SeafDirent dirent;
+    dirent.type = FILE;
+    dirent.name = name;
+    dirent.size = size;
+
+    initCommonFields(&dirent);
+    return dirent;
 }

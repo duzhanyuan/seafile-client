@@ -22,16 +22,18 @@ public:
 
   FileBrowserDialog *getDialog(const Account &account, const QString &repo_id);
 
+public slots:
   void closeAllDialogByAccount(const Account &account);
 
 private slots:
   void onAboutToClose();
+  void closeAllDialogs();
 
 private:
   FileBrowserManager(const FileBrowserManager*); // DELETED
   FileBrowserManager& operator=(const FileBrowserManager*); // DELETED
 
-  FileBrowserManager() {}
+  FileBrowserManager();
   static FileBrowserManager *instance_;
   QList<FileBrowserDialog*> dialogs_;
 };

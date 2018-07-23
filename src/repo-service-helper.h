@@ -4,10 +4,13 @@
 #include <QObject>
 #include <QString>
 #include <QList>
+#include <QScopedPointer>
+
 #include "account.h"
+#include "api/api-error.h"
 #include "api/server-repo.h"
 #include "filebrowser/seaf-dirent.h"
-#include "api/api-error.h"
+#include "filebrowser/data-mgr.h"
 
 class GetDirentsRequest;
 class QWidget;

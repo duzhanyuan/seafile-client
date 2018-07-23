@@ -29,10 +29,18 @@ public:
     QString token;
     qint64 lastVisited;
     bool isShibboleth;
+    bool isAutomaticLogin;
+    QString s2fa_token;
 
     ~Account();
-    Account() : serverInfoRequest(NULL), serverInfo(), lastVisited(0), isShibboleth(false) {}
-    Account(QUrl serverUrl, QString username, QString token, qint64 lastVisited=0, bool isShibboleth = false)
+    Account() : serverInfoRequest(NULL),
+                serverInfo(),
+                lastVisited(0),
+                isShibboleth(false),
+                isAutomaticLogin(true) {}
+    Account(QUrl serverUrl, QString username, QString token,
+            qint64 lastVisited=0, bool isShibboleth = false,
+            bool isAutomaticLogin = true, QString s2fa_token = QString())
         : serverInfoRequest(NULL),
           serverInfo(),
           accountInfo(),
@@ -40,7 +48,9 @@ public:
           username(username),
           token(token),
           lastVisited(lastVisited),
-          isShibboleth(isShibboleth) {}
+          isShibboleth(isShibboleth),
+          isAutomaticLogin(isAutomaticLogin),
+          s2fa_token(s2fa_token) {}
 
     Account(const Account &rhs)
       : serverInfoRequest(NULL),
@@ -50,7 +60,9 @@ public:
         username(rhs.username),
         token(rhs.token),
         lastVisited(rhs.lastVisited),
-        isShibboleth(rhs.isShibboleth)
+        isShibboleth(rhs.isShibboleth),
+        isAutomaticLogin(rhs.isAutomaticLogin),
+        s2fa_token(rhs.s2fa_token)
     {
     }
 
@@ -63,6 +75,8 @@ public:
         token = rhs.token;
         lastVisited = rhs.lastVisited;
         isShibboleth = rhs.isShibboleth;
+        isAutomaticLogin = rhs.isAutomaticLogin;
+        s2fa_token = rhs.s2fa_token;
         return *this;
     }
 
@@ -77,6 +91,10 @@ public:
 
     bool isValid() const {
         return token.length() > 0;
+    }
+
+    bool hasS2FAToken() const {
+        return s2fa_token.length() > 0;
     }
 
     bool isPro() const {
